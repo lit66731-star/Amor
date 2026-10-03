@@ -10,7 +10,7 @@ import {
 } from '../../../../script.js';
 
 const extensionName = 'amor';
-const VERSION = '1.2.0';
+const VERSION = '1.2.1';
 
 // ---------------- 维度常量 ----------------
 const RHYTHMS = ['平缓', '日常', '暧昧', '紧张', '冲突', '高潮', '余波'];

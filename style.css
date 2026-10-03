@@ -21,6 +21,8 @@
     height: 100dvh;
     box-sizing: border-box;
 }
+/* 消除酒馆主题继承的文字外发光/阴影 */
+#st-amor, #st-amor * { text-shadow: none !important; }
 
 /* 顶栏 */
 #st-amor .amor__head {
@@ -167,7 +169,7 @@
 #st-amor .amor__focus-row { display: flex; align-items: center; gap: 12px; margin-bottom: 10px; }
 #st-amor .amor__focus-row:last-child { margin-bottom: 0; }
 #st-amor .amor__focus-label { flex: 0 0 72px; font-size: 13px; color: var(--amor-text); }
-#st-amor .amor__focus-row input[type="range"] { flex: 1; min-width: 0; accent-color: var(--amor-accent); }
+#st-amor .amor__focus-row input[type="range"] { flex: 1; min-width: 0; }
 
 /* 角色主动性 */
 #st-amor .amor__init-row { display: flex; align-items: center; gap: 12px; margin-bottom: 10px; }
@@ -176,8 +178,48 @@
 #st-amor .amor__init-row .amor__seg-btn { padding: 5px 12px; }
 
 /* 推进速度 */
-#st-amor .amor__pacing { width: 100%; accent-color: var(--amor-accent); }
+#st-amor .amor__pacing { width: 100%; }
 #st-amor .amor__pacing-hint { margin-top: 6px; font-size: 12px; color: var(--amor-text-soft); }
+
+/* ============ 滑条（自绘轨道 + 圆点，避免主题无轨道/无滑块） ============ */
+#st-amor input[type="range"] {
+    -webkit-appearance: none;
+    appearance: none;
+    background: transparent;
+    height: 22px;
+    margin: 0;
+    cursor: pointer;
+}
+#st-amor input[type="range"]::-webkit-slider-runnable-track {
+    height: 4px;
+    background: #e2d8ce;
+    border-radius: 2px;
+}
+#st-amor input[type="range"]::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    height: 18px;
+    width: 18px;
+    margin-top: -7px;
+    background: var(--amor-accent);
+    border: 2px solid #fff;
+    border-radius: 50%;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.2);
+}
+#st-amor input[type="range"]::-moz-range-track {
+    height: 4px;
+    background: #e2d8ce;
+    border-radius: 2px;
+}
+#st-amor input[type="range"]::-moz-range-thumb {
+    height: 16px;
+    width: 16px;
+    background: var(--amor-accent);
+    border: 2px solid #fff;
+    border-radius: 50%;
+}
+#st-amor input[type="range"]:focus { outline: none; }
+#st-amor input[type="range"]:focus::-webkit-slider-thumb { box-shadow: 0 0 0 3px var(--amor-accent-soft); }
 
 /* 自定义指令 */
 #st-amor .amor__custom {
