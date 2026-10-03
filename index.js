@@ -10,7 +10,7 @@ import {
 } from '../../../../script.js';
 
 const extensionName = 'amor';
-const VERSION = '1.1.0';
+const VERSION = '1.2.0';
 
 // ---------------- 维度常量 ----------------
 const RHYTHMS = ['平缓', '日常', '暧昧', '紧张', '冲突', '高潮', '余波'];
@@ -41,6 +41,8 @@ function freshSettings() {
         autoDirector: false,   // 自动导演模式（每轮生成后 AI 分析并调整旋钮）
         autoNote: '',          // AI 自动生成的导演指令
         lastAnalysisAt: 0,     // 上次自动分析时间戳
+        autoRefresh: false,    // 定时自动刷新（开启自动导演时按间隔重新分析）
+        autoRefreshSec: 60,    // 定时刷新间隔（秒）
         presets: [],           // [{ id, name, data }]
     };
 }
@@ -64,6 +66,8 @@ function loadSettings() {
     if (typeof s.autoDirector !== 'boolean') s.autoDirector = !!s.autoDirector;
     if (typeof s.autoNote !== 'string') s.autoNote = '';
     if (typeof s.lastAnalysisAt !== 'number') s.lastAnalysisAt = 0;
+    if (typeof s.autoRefresh !== 'boolean') s.autoRefresh = !!s.autoRefresh;
+    if (typeof s.autoRefreshSec !== 'number' || s.autoRefreshSec < 15) s.autoRefreshSec = 60;
     if (!Array.isArray(s.presets)) s.presets = [];
     settings = s;
 }
@@ -113,7 +117,7 @@ function updatePromptInjection() {
 }
 
 // ---------------- 自动导演（AI 分析剧情 → 生成并应用导演指令） ----------------
-const DIRECTOR_PROMPT = `你是 Amor 导演台的剧情导演。根据下面最近的剧情，判断下一段剧情该怎么导：节奏、镜头、叙事重点、角色主动性、推进速度，并写一句具体的导演指令。
+const DIRECTOR_PROMPT = `你是 Amor 导演台的剧情导演。根据下面给的剧情背景与最近剧情，判断下一段剧情该怎么导：节奏、镜头、叙事重点、角色主动性、推进速度，并写一句具体的导演指令。
 
 可用节奏：${RHYTHMS.join('/')}
 可用镜头：${CAMERAS.join('/')}
@@ -121,7 +125,7 @@ const DIRECTOR_PROMPT = `你是 Amor 导演台的剧情导演。根据下面最�
 角色主动性（用户角色/AI角色/NPC，各 低/中/高）
 推进速度（0-10，0 极慢，10 极快）
 
-最近剧情：
+{contextBlock}最近剧情：
 {transcript}
 
 严格按下面格式输出，每行一项，不要多余内容，不要用 markdown：
@@ -141,6 +145,17 @@ function buildTranscript() {
     if (!Array.isArray(chat)) return '';
     const recent = chat.filter(m => m && typeof m.mes === 'string' && m.mes.trim() && !m.is_system).slice(-12);
     return recent.map(m => (m.is_user ? '用户' : (m.name || '角色')) + '：' + m.mes).join('\n\n');
+}
+
+// 读取 Serendipity 的剧情上下文（已安装则给导演完整故事背景，否则为空 → 只用最近对话）
+function getStoryContext() {
+    try {
+        if (typeof window.Serendipity === 'object' && typeof window.Serendipity.getDirectorContext === 'function') {
+            const c = window.Serendipity.getDirectorContext();
+            if (c && c.trim()) return c;
+        }
+    } catch (e) {}
+    return '';
 }
 
 function parseDirectorOutput(text) {
@@ -181,7 +196,10 @@ async function autoDirect() {
         $('#st-amor .amor__auto-note').show().find('.amor__auto-note-body').text('导演分析中…');
     }
     try {
-        const result = await generateRaw({ prompt: DIRECTOR_PROMPT.replace('{transcript}', transcript), systemPrompt: '你是一位专业的剧情导演，只负责决定下一段剧情怎么导。' });
+        const ctx = getStoryContext();
+        const contextBlock = ctx ? '剧情背景（整个故事的当前状态，导戏时注意与它保持一致）：\n' + ctx + '\n\n' : '';
+        const prompt = DIRECTOR_PROMPT.replace('{contextBlock}', contextBlock).replace('{transcript}', transcript);
+        const result = await generateRaw({ prompt, systemPrompt: '你是一位专业的剧情导演，只负责决定下一段剧情怎么导。' });
         const d = parseDirectorOutput(result);
         settings.rhythm = d.rhythm;
         settings.camera = d.camera;
@@ -197,6 +215,15 @@ async function autoDirect() {
         console.warn('[Amor] 自动导演分析失败：', e);
     } finally {
         isAutoDirecting = false;
+    }
+}
+
+let autoRefreshTimer = null;
+function syncAutoRefreshTimer() {
+    if (autoRefreshTimer) { clearInterval(autoRefreshTimer); autoRefreshTimer = null; }
+    if (settings.autoDirector && settings.autoRefresh) {
+        const sec = Math.max(15, Math.min(600, settings.autoRefreshSec || 60));
+        autoRefreshTimer = setInterval(() => autoDirect(), sec * 1000);
     }
 }
 
@@ -244,6 +271,18 @@ function buildPanel() {
           <div class="amor__auto-note-head">AI 导演指令</div>
           <div class="amor__auto-note-body"></div>
         </div>
+        <div class="amor__auto-ctl">
+          <div class="amor__auto-ctl-row">
+            <button type="button" class="amor__direct-now">立即导演</button>
+            <span class="amor__link-status"></span>
+          </div>
+          <div class="amor__auto-ctl-row">
+            <label class="amor__switch amor__switch--sm"><input type="checkbox" class="amor__auto-refresh"><span class="amor__switch-slider"></span></label>
+            <span class="amor__auto-ctl-label">定时自动刷新</span>
+            <input type="number" class="amor__auto-refresh-sec" min="15" max="600" step="5">
+            <span class="amor__auto-ctl-label">秒</span>
+          </div>
+        </div>
 
         <div class="amor__section">
           <div class="amor__label">剧情节奏</div>
@@ -285,7 +324,7 @@ function buildPanel() {
           <div class="amor__presets"></div>
         </div>
 
-        <div class="amor__hint">导演模式开启后，每次生成都会在角色设定之前注入一段「导演指令」，控制 AI 的节奏 / 镜头 / 叙事重点 / 角色主动性 / 推进速度。指令优先级最高，AI 会照着演。开启「自动导演」后，每轮生成结束 AI 会自动分析剧情、调整下方旋钮并写一句导演指令。</div>
+        <div class="amor__hint">导演模式开启后，每次生成都会在角色设定之前注入一段「导演指令」，控制 AI 的节奏 / 镜头 / 叙事重点 / 角色主动性 / 推进速度。指令优先级最高，AI 会照着演。开启「自动导演」后，每轮生成结束 AI 会自动分析剧情、调整下方旋钮并写一句导演指令；若已安装 Serendipity，会自动读取其剧情时间/时间线/人物/关系/世界状态/伏笔作为剧情背景。可点「立即导演」手动分析，或开启「定时自动刷新」按间隔持续分析。</div>
       </div>
     </div>`;
     $('body').append(html);
@@ -306,6 +345,11 @@ function renderPanel() {
     } else {
         noteWrap.hide();
     }
+
+    panel.find('.amor__auto-refresh').prop('checked', settings.autoRefresh);
+    panel.find('.amor__auto-refresh-sec').val(settings.autoRefreshSec);
+    const hasSD = typeof window.Serendipity === 'object' && typeof window.Serendipity.getDirectorContext === 'function';
+    panel.find('.amor__link-status').text(hasSD ? '已接入 Serendipity 剧情上下文' : '未检测到 Serendipity（仅用最近对话）');
 
     // 剧情节奏
     const r = panel.find('.amor__rhythm').empty();
@@ -379,6 +423,7 @@ function bindPanelEvents() {
         updatePromptInjection();
         panel.toggleClass('amor__on', settings.enabled);
         renderPanel();
+        syncAutoRefreshTimer();
     });
 
     // 自动导演开关
@@ -392,7 +437,31 @@ function bindPanelEvents() {
         saveSettings();
         updatePromptInjection();
         renderPanel();
+        syncAutoRefreshTimer();
         if (settings.autoDirector) autoDirect();
+    });
+
+    // 立即导演（手动触发一次分析）
+    panel.on('click', '.amor__direct-now', function () {
+        if (!settings.autoDirector) { toastr.warning('请先开启「自动导演」'); return; }
+        toastr.info('正在分析剧情…');
+        autoDirect();
+    });
+
+    // 定时自动刷新
+    panel.on('change', '.amor__auto-refresh', function () {
+        settings.autoRefresh = this.checked;
+        saveSettings();
+        syncAutoRefreshTimer();
+    });
+    panel.on('change', '.amor__auto-refresh-sec', function () {
+        let v = parseInt(this.value, 10);
+        if (isNaN(v) || v < 15) v = 15;
+        if (v > 600) v = 600;
+        settings.autoRefreshSec = v;
+        this.value = v;
+        saveSettings();
+        syncAutoRefreshTimer();
     });
 
     // 剧情节奏 / 镜头（单选，再点取消）
@@ -469,6 +538,7 @@ jQuery(async () => {
     buildMenuButton();
     buildPanel();
     updatePromptInjection();
+    syncAutoRefreshTimer();
 
     eventSource.on(event_types.CHAT_CHANGED, () => {
         setTimeout(() => { updatePromptInjection(); }, 100);
