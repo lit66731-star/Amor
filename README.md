@@ -13,7 +13,7 @@ SillyTavern 第三方扩展。不是记忆剧情，而是**像导演一样控制
 
 ## 怎么用
 
-1. 酒馆 → 扩展 → 安装扩展 → 粘贴本仓库 Git 地址：`https://github.com/lit66731-star/st-amor.git`。（酒馆所在机器需装有 git；Termux 用户先 `pkg install git`。）
+1. 酒馆 → 扩展 → 安装扩展 → 粘贴本仓库 Git 地址：`https://github.com/lit66731-star/Amor.git`。（酒馆所在机器需装有 git；Termux 用户先 `pkg install git`。）
 2. 点扩展菜单里的「Amor」打开导演台。
 3. 打开顶部「导演模式」开关，调好各项。
 4. 直接发消息即可——每轮生成都会在角色设定之前注入导演指令，AI 照着节奏、镜头、重点来演。
