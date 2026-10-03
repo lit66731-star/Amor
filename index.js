@@ -1,5 +1,7 @@
 import { extension_settings } from '../../../extensions.js';
 import {
+    chat,
+    generateRaw,
     eventSource,
     event_types,
     setExtensionPrompt,
@@ -8,7 +10,7 @@ import {
 } from '../../../../script.js';
 
 const extensionName = 'amor';
-const VERSION = '1.0.0';
+const VERSION = '1.1.0';
 
 // ---------------- 维度常量 ----------------
 const RHYTHMS = ['平缓', '日常', '暧昧', '紧张', '冲突', '高潮', '余波'];
@@ -36,6 +38,9 @@ function freshSettings() {
         initiative: { user: '中', ai: '中', npc: '中' },   // 低/中/高
         pacing: 5,             // 0-10，0=慢 10=快
         custom: '',            // 自定义导演指令
+        autoDirector: false,   // 自动导演模式（每轮生成后 AI 分析并调整旋钮）
+        autoNote: '',          // AI 自动生成的导演指令
+        lastAnalysisAt: 0,     // 上次自动分析时间戳
         presets: [],           // [{ id, name, data }]
     };
 }
@@ -56,6 +61,9 @@ function loadSettings() {
     if (typeof s.camera !== 'string') s.camera = '';
     if (typeof s.custom !== 'string') s.custom = '';
     if (s.pacing == null) s.pacing = def.pacing;
+    if (typeof s.autoDirector !== 'boolean') s.autoDirector = !!s.autoDirector;
+    if (typeof s.autoNote !== 'string') s.autoNote = '';
+    if (typeof s.lastAnalysisAt !== 'number') s.lastAnalysisAt = 0;
     if (!Array.isArray(s.presets)) s.presets = [];
     settings = s;
 }
@@ -83,6 +91,7 @@ function buildDirectorPrompt() {
     if (!settings.enabled) return '';
     const lines = ['[Amor 导演指令]'];
     lines.push('以下是你本轮剧情创作必须严格遵守的导演指令，优先级高于角色设定与历史对话，请完全依照它来创作本段剧情，不要偏离。');
+    if (settings.autoDirector && settings.autoNote && settings.autoNote.trim()) lines.push('· 导演特别指示：' + settings.autoNote.trim() + '。');
     if (settings.rhythm) lines.push('· 剧情节奏：' + settings.rhythm + '。');
     if (settings.camera) lines.push('· 镜头语言：' + settings.camera + '。');
     const f = settings.focus || {};
@@ -101,6 +110,94 @@ function updatePromptInjection() {
         extension_prompt_types.BEFORE_PROMPT,
         0,
     );
+}
+
+// ---------------- 自动导演（AI 分析剧情 → 生成并应用导演指令） ----------------
+const DIRECTOR_PROMPT = `你是 Amor 导演台的剧情导演。根据下面最近的剧情，判断下一段剧情该怎么导：节奏、镜头、叙事重点、角色主动性、推进速度，并写一句具体的导演指令。
+
+可用节奏：${RHYTHMS.join('/')}
+可用镜头：${CAMERAS.join('/')}
+叙事重点（人物心理/环境描写/对白/动作，各 0-10，条越满越侧重）
+角色主动性（用户角色/AI角色/NPC，各 低/中/高）
+推进速度（0-10，0 极慢，10 极快）
+
+最近剧情：
+{transcript}
+
+严格按下面格式输出，每行一项，不要多余内容，不要用 markdown：
+【节奏】<节奏词>
+【镜头】<镜头词>
+【心理】<0-10>
+【环境】<0-10>
+【对白】<0-10>
+【动作】<0-10>
+【用户主动性】<低/中/高>
+【AI主动性】<低/中/高>
+【NPC主动性】<低/中/高>
+【速度】<0-10>
+【指令】<一句具体导演指令，说明本段该怎么演，如：本轮不要推进主线，只深化两人的关系>`;
+
+function buildTranscript() {
+    if (!Array.isArray(chat)) return '';
+    const recent = chat.filter(m => m && typeof m.mes === 'string' && m.mes.trim() && !m.is_system).slice(-12);
+    return recent.map(m => (m.is_user ? '用户' : (m.name || '角色')) + '：' + m.mes).join('\n\n');
+}
+
+function parseDirectorOutput(text) {
+    text = text || '';
+    const get = (label) => {
+        const m = text.match(new RegExp('【' + label + '】\\s*([^\\n【]+)'));
+        return m ? m[1].trim() : '';
+    };
+    const clamp = (v, lo, hi, def) => { const n = parseInt(v, 10); return isNaN(n) ? def : Math.max(lo, Math.min(hi, n)); };
+    const pick = (v, list) => (list.includes(v) ? v : '');
+    const init = (v) => (['低', '中', '高'].includes(v) ? v : '中');
+    return {
+        rhythm: pick(get('节奏'), RHYTHMS),
+        camera: pick(get('镜头'), CAMERAS),
+        focus: {
+            psy: clamp(get('心理'), 0, 10, 5),
+            env: clamp(get('环境'), 0, 10, 3),
+            dialog: clamp(get('对白'), 0, 10, 5),
+            action: clamp(get('动作'), 0, 10, 5),
+        },
+        initiative: {
+            user: init(get('用户主动性')),
+            ai: init(get('AI主动性')),
+            npc: init(get('NPC主动性')),
+        },
+        pacing: clamp(get('速度'), 0, 10, 5),
+        note: get('指令'),
+    };
+}
+
+let isAutoDirecting = false;
+async function autoDirect() {
+    if (!settings.autoDirector || isAutoDirecting) return;
+    const transcript = buildTranscript();
+    if (!transcript) return;
+    isAutoDirecting = true;
+    if ($('#st-amor').is(':visible')) {
+        $('#st-amor .amor__auto-note').show().find('.amor__auto-note-body').text('导演分析中…');
+    }
+    try {
+        const result = await generateRaw({ prompt: DIRECTOR_PROMPT.replace('{transcript}', transcript), systemPrompt: '你是一位专业的剧情导演，只负责决定下一段剧情怎么导。' });
+        const d = parseDirectorOutput(result);
+        settings.rhythm = d.rhythm;
+        settings.camera = d.camera;
+        settings.focus = d.focus;
+        settings.initiative = d.initiative;
+        settings.pacing = d.pacing;
+        settings.autoNote = d.note;
+        settings.lastAnalysisAt = Date.now();
+        saveSettings();
+        updatePromptInjection();
+        if ($('#st-amor').is(':visible')) renderPanel();
+    } catch (e) {
+        console.warn('[Amor] 自动导演分析失败：', e);
+    } finally {
+        isAutoDirecting = false;
+    }
 }
 
 // ---------------- 面板 ----------------
@@ -139,6 +236,13 @@ function buildPanel() {
         <div class="amor__master">
           <label class="amor__switch"><input type="checkbox" class="amor__enabled"><span class="amor__switch-slider"></span></label>
           <span class="amor__master-label">导演模式</span>
+          <span class="amor__master-sep"></span>
+          <label class="amor__switch"><input type="checkbox" class="amor__auto"><span class="amor__switch-slider"></span></label>
+          <span class="amor__master-label">自动导演</span>
+        </div>
+        <div class="amor__auto-note" style="display:none">
+          <div class="amor__auto-note-head">AI 导演指令</div>
+          <div class="amor__auto-note-body"></div>
         </div>
 
         <div class="amor__section">
@@ -181,7 +285,7 @@ function buildPanel() {
           <div class="amor__presets"></div>
         </div>
 
-        <div class="amor__hint">导演模式开启后，每次生成都会在角色设定之前注入一段「导演指令」，控制 AI 的节奏 / 镜头 / 叙事重点 / 角色主动性 / 推进速度。指令优先级最高，AI 会照着演。</div>
+        <div class="amor__hint">导演模式开启后，每次生成都会在角色设定之前注入一段「导演指令」，控制 AI 的节奏 / 镜头 / 叙事重点 / 角色主动性 / 推进速度。指令优先级最高，AI 会照着演。开启「自动导演」后，每轮生成结束 AI 会自动分析剧情、调整下方旋钮并写一句导演指令。</div>
       </div>
     </div>`;
     $('body').append(html);
@@ -192,7 +296,16 @@ function renderPanel() {
     const panel = $('#st-amor');
     if (!panel.length) return;
     panel.find('.amor__enabled').prop('checked', settings.enabled);
+    panel.find('.amor__auto').prop('checked', settings.autoDirector);
     panel.toggleClass('amor__on', settings.enabled);
+
+    const noteWrap = panel.find('.amor__auto-note');
+    if (settings.autoDirector) {
+        noteWrap.show();
+        noteWrap.find('.amor__auto-note-body').text(settings.autoNote && settings.autoNote.trim() ? settings.autoNote : '导演分析中…');
+    } else {
+        noteWrap.hide();
+    }
 
     // 剧情节奏
     const r = panel.find('.amor__rhythm').empty();
@@ -261,9 +374,25 @@ function bindPanelEvents() {
     // 导演模式总开关
     panel.on('change', '.amor__enabled', function () {
         settings.enabled = this.checked;
+        if (!settings.enabled) settings.autoDirector = false;
         saveSettings();
         updatePromptInjection();
         panel.toggleClass('amor__on', settings.enabled);
+        renderPanel();
+    });
+
+    // 自动导演开关
+    panel.on('change', '.amor__auto', function () {
+        settings.autoDirector = this.checked;
+        if (settings.autoDirector) {
+            settings.enabled = true;
+            panel.find('.amor__enabled').prop('checked', true);
+            panel.toggleClass('amor__on', true);
+        }
+        saveSettings();
+        updatePromptInjection();
+        renderPanel();
+        if (settings.autoDirector) autoDirect();
     });
 
     // 剧情节奏 / 镜头（单选，再点取消）
@@ -343,5 +472,10 @@ jQuery(async () => {
 
     eventSource.on(event_types.CHAT_CHANGED, () => {
         setTimeout(() => { updatePromptInjection(); }, 100);
+    });
+
+    // 每轮生成结束后，自动导演分析剧情并调整下一轮的导演指令
+    eventSource.on(event_types.GENERATION_ENDED, () => {
+        setTimeout(() => autoDirect(), 300);
     });
 });

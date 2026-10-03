@@ -69,7 +69,24 @@
     border-radius: 12px;
 }
 #st-amor .amor__master-label { font-size: 16px; font-weight: 600; }
+#st-amor .amor__master-sep { flex: 0 0 1px; align-self: stretch; background: var(--amor-border); margin: 0 6px; }
 #st-amor.amor__on .amor__master { border-color: var(--amor-accent); }
+
+/* AI 导演指令提示框 */
+#st-amor .amor__auto-note {
+    margin: -8px 0 20px;
+    padding: 14px 16px;
+    background: var(--amor-accent-soft);
+    border: 1px solid var(--amor-accent);
+    border-radius: 12px;
+}
+#st-amor .amor__auto-note-head {
+    font-size: 12px;
+    letter-spacing: 0.06em;
+    color: var(--amor-accent);
+    margin-bottom: 6px;
+}
+#st-amor .amor__auto-note-body { font-size: 14px; line-height: 1.6; color: var(--amor-text); }
 
 #st-amor .amor__switch { position: relative; display: inline-block; width: 44px; height: 24px; flex: 0 0 auto; }
 #st-amor .amor__switch input { opacity: 0; width: 0; height: 0; }
