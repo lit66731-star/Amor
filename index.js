@@ -17,7 +17,7 @@ import { selected_group } from '../../../group-chats.js';
 import { getStringHash } from '../../../utils.js';
 
 const extensionName = 'amor';
-const VERSION = '1.10.2';
+const VERSION = '1.10.3';
 
 // ---------------- 维度常量 ----------------
 const RHYTHMS = ['平缓', '日常', '暧昧', '紧张', '冲突', '高潮', '余波'];
@@ -1627,14 +1627,17 @@ function buildPlanBlock(s, cd) {
         '玩家自主权：不得替 {{user}} 做重大决定（杀人、告白、背叛、接受任务、离开等）。可以制造压力、提供机会、改变环境、让其他人物行动，把选择留给 {{user}}。';
 }
 
-function updatePlannerInjection() {
-    let text = '';
+function currentPlanInjection() {
     try {
         const cd = plannerChatData();
-        if (settings.planner.enabled && settings.planner.mode !== 'manual' && cd) text = buildPlanBlock(cd.directorState, cd);
+        if (settings.planner.enabled && settings.planner.mode !== 'manual' && cd) return buildPlanBlock(cd.directorState, cd);
     } catch (e) {
         console.warn('[Amor] 构建规划注入失败：', e);
     }
+    return '';
+}
+function updatePlannerInjection() {
+    const text = currentPlanInjection();
     // 放在聊天记录靠近末尾处（深度 1），比放进系统提示词区域更能影响下一条回复
     setExtensionPrompt('amor_story', text, extension_prompt_types.IN_CHAT, PLAN_INJECT_DEPTH);
 }
@@ -2318,6 +2321,17 @@ function renderOverview() {
     const sc = s.scene;
     const sec = (title) => { const d = $('<div class="amor__section">').append($('<div class="amor__label">').text(title)); box.append(d); return d; };
     const item = (d, label, val) => { if (!val) return; if (label) d.append($('<div class="amor__ov-label">').text(label)); d.append($('<div class="amor__ov-val">').text(val)); };
+
+    const pv = sec('当前注入内容（下一条回复实际会收到的 Amor 指令，只读）');
+    const dirText = settings.enabled ? buildDirectorPrompt() : '';
+    const planText = currentPlanInjection();
+    const preview = (title, text, empty) => {
+        const d = $('<details class="amor__ov-pv">').append($('<summary>').text(title + (text ? '（' + text.length + ' 字）' : '（无）')));
+        d.append($('<pre class="amor__ov-pre">').text(text || empty));
+        pv.append(d);
+    };
+    preview('导演台指令', dirText, settings.enabled ? '导演台没有产生任何指令。' : '导演台未开启，不注入。');
+    preview('剧情规划指令', planText, p.enabled ? (p.mode === 'manual' ? '手动模式：只分析，不注入。' : '还没有规划内容，暂不注入。') : '剧情规划未开启，不注入。');
 
     const st = sec('运行状态');
     const bits = [

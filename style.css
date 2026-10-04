@@ -437,6 +437,15 @@
 #st-amor .amor__ov-val { margin-top: 2px; font-size: 14px; line-height: 1.6; color: var(--amor-text); }
 #st-amor .amor__ov .amor__p-tension { margin: 4px 0 0; }
 
+#st-amor .amor__ov-pv { margin-bottom: 8px; }
+#st-amor .amor__ov-pv summary { cursor: pointer; font-size: 13px; color: var(--amor-text); }
+#st-amor .amor__ov-pre {
+    margin: 8px 0 0; padding: 10px 12px; max-height: 260px; overflow: auto;
+    font-size: 12px; line-height: 1.6; white-space: pre-wrap; word-break: break-all;
+    background: var(--amor-bg); border: 1px solid var(--amor-border); border-radius: 8px;
+    color: var(--amor-text); font-family: inherit;
+}
+
 /* 移动端 */
 @media (max-width: 480px) {
     #st-amor .amor__body { padding: 16px 14px 40px; }
