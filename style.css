@@ -271,8 +271,76 @@
 /* 提示 */
 #st-amor .amor__hint { margin-top: 4px; font-size: 12px; line-height: 1.6; color: var(--amor-text-soft); }
 
+/* ============ 标签页 ============ */
+#st-amor .amor__tabs {
+    flex: 0 0 auto;
+    display: flex;
+    gap: 8px;
+    padding: 10px 24px;
+    border-bottom: 1px solid var(--amor-border);
+}
+#st-amor .amor__tab {
+    padding: 6px 16px; font-size: 14px;
+    background: transparent; color: var(--amor-text-soft);
+    border: 1px solid transparent; border-radius: 8px; cursor: pointer;
+}
+#st-amor .amor__tab:hover { color: var(--amor-text); }
+#st-amor .amor__tab.on { background: var(--amor-dark); border-color: var(--amor-dark); color: #fff; }
+
+/* ============ 剧情规划 ============ */
+#st-amor .amor__p-mode {
+    flex: 1; min-width: 0; padding: 6px 8px; font-size: 13px;
+    border: 1px solid var(--amor-border); border-radius: 6px;
+    color: var(--amor-text); background: var(--amor-surface); font-family: inherit;
+}
+#st-amor .amor__p-reset {
+    padding: 7px 14px; font-size: 13px; background: transparent;
+    border: 1px solid var(--amor-border); border-radius: 8px;
+    color: var(--amor-text); cursor: pointer;
+}
+#st-amor .amor__p-reset:hover { border-color: #c96a5a; color: #c96a5a; }
+#st-amor .amor__p-status { font-size: 12px; color: var(--amor-accent); }
+#st-amor .amor__p-field { margin-bottom: 12px; }
+#st-amor .amor__p-field-label { font-size: 12px; color: var(--amor-text-soft); margin-bottom: 4px; }
+#st-amor .amor__p-sub { margin: 16px 0 10px; letter-spacing: 0.04em; }
+#st-amor .amor__p-text,
+#st-amor .amor__p-set,
+#st-amor .amor__p-api {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 9px 12px;
+    font-size: 13px;
+    line-height: 1.5;
+    color: var(--amor-text);
+    background: var(--amor-surface);
+    border: 1px solid var(--amor-border);
+    border-radius: 8px;
+    font-family: inherit;
+}
+#st-amor .amor__p-text { resize: vertical; }
+#st-amor .amor__p-text:focus,
+#st-amor .amor__p-set:focus,
+#st-amor .amor__p-api:focus { outline: none; border-color: var(--amor-accent); }
+#st-amor .amor__p-text:disabled { opacity: 0.5; }
+#st-amor .amor__p-tension { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; font-size: 13px; }
+#st-amor .amor__p-bar { flex: 1; height: 6px; background: #e2d8ce; border-radius: 3px; overflow: hidden; }
+#st-amor .amor__p-bar i { display: block; height: 100%; width: 50%; background: var(--amor-accent); border-radius: 3px; transition: width 0.3s; }
+#st-amor .amor__p-tension-val { width: 28px; text-align: right; color: var(--amor-text-soft); font-weight: 400; }
+#st-amor .amor__p-warn {
+    margin-bottom: 12px; padding: 8px 12px; font-size: 12px; line-height: 1.5;
+    background: var(--amor-accent-soft); border: 1px solid var(--amor-accent);
+    border-radius: 8px; color: var(--amor-text);
+}
+#st-amor .amor__p-outcomes { list-style: none; margin: 0; padding: 0; }
+#st-amor .amor__p-outcomes li {
+    padding: 8px 0 8px 12px; font-size: 13px; line-height: 1.5;
+    border-left: 2px solid var(--amor-accent); margin-bottom: 8px;
+}
+#st-amor .amor__p-outcomes li.is-empty { border-left-color: var(--amor-border); color: var(--amor-text-soft); }
+
 /* 移动端 */
 @media (max-width: 480px) {
     #st-amor .amor__body { padding: 16px 14px 40px; }
     #st-amor .amor__head { padding: 14px 16px 10px; }
+    #st-amor .amor__tabs { padding: 8px 14px; }
 }

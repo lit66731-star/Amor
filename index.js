@@ -7,10 +7,15 @@ import {
     setExtensionPrompt,
     extension_prompt_types,
     saveSettingsDebounced,
+    chat_metadata,
+    characters,
+    this_chid,
 } from '../../../../script.js';
+import { selected_group } from '../../../group-chats.js';
+import { getStringHash } from '../../../utils.js';
 
 const extensionName = 'amor';
-const VERSION = '1.2.1';
+const VERSION = '1.3.0';
 
 // ---------------- 维度常量 ----------------
 const RHYTHMS = ['平缓', '日常', '暧昧', '紧张', '冲突', '高潮', '余波'];
@@ -44,6 +49,17 @@ function freshSettings() {
         autoRefresh: false,    // 定时自动刷新（开启自动导演时按间隔重新分析）
         autoRefreshSec: 60,    // 定时刷新间隔（秒）
         presets: [],           // [{ id, name, data }]
+        planner: freshPlanner(),   // 剧情规划（场景 / 目标 / 冲突 / 节拍）
+    };
+}
+function freshPlanner() {
+    return {
+        enabled: false,
+        mode: 'assisted',      // assisted 自动规划并注入 | manual 只分析不注入
+        everyN: 1,             // 每几轮规划一次
+        tokenBudget: 2500,     // 向 Serendipity 索取事实的预算
+        api: { url: '', key: '', model: '' },   // 规划专用模型，留空则用酒馆当前 API
+        chats: {},             // 按「角色 + 聊天」分开存的规划状态
     };
 }
 let settings = freshSettings();
@@ -69,6 +85,15 @@ function loadSettings() {
     if (typeof s.autoRefresh !== 'boolean') s.autoRefresh = !!s.autoRefresh;
     if (typeof s.autoRefreshSec !== 'number' || s.autoRefreshSec < 15) s.autoRefreshSec = 60;
     if (!Array.isArray(s.presets)) s.presets = [];
+    const pdef = freshPlanner();
+    const p = (s.planner && typeof s.planner === 'object' && !Array.isArray(s.planner)) ? s.planner : {};
+    p.api = Object.assign({}, pdef.api, (p.api && typeof p.api === 'object') ? p.api : {});
+    if (typeof p.enabled !== 'boolean') p.enabled = false;
+    if (p.mode !== 'manual') p.mode = 'assisted';
+    if (!Number.isFinite(p.everyN) || p.everyN < 1) p.everyN = pdef.everyN;
+    if (!Number.isFinite(p.tokenBudget) || p.tokenBudget < 500) p.tokenBudget = pdef.tokenBudget;
+    if (!p.chats || typeof p.chats !== 'object' || Array.isArray(p.chats)) p.chats = {};
+    s.planner = p;
     settings = s;
 }
 
@@ -227,6 +252,629 @@ function syncAutoRefreshTimer() {
     }
 }
 
+// ---------------- 剧情规划（场景 / 目标 / 冲突 / 节拍，评估实际结果后重规划） ----------------
+// 与上面的「导演台旋钮」互不干扰：旋钮管「怎么写」（节奏/镜头/重点），规划管「写什么」（这一幕要发生什么变化）。
+const PLAN_DELAY_MS = 1500;      // 生成结束后等一会再规划，让 Serendipity 先把这一轮记完
+const PLAN_TIMEOUT_MS = 120000;
+const MAX_SNAPSHOTS = 60;        // 每轮规划留一份快照，用于删除/重生成/Swipe 时回滚
+const MAX_OUTCOMES = 30;
+const TRANSCRIPT_MESSAGES = 6;   // 喂给规划的最近消息条数
+const TRANSCRIPT_CHARS = 1200;   // 单条消息截断长度
+
+const PLAN_FIELDS = [
+    { path: 'scene.situation', label: '当前场景', rows: 2 },
+    { path: 'scene.location', label: '地点', rows: 1 },
+    { path: 'scene.participants', label: '在场人物', rows: 1 },
+    { path: 'scene.objective', label: '场景目标', rows: 2 },
+    { path: 'scene.conflict', label: '当前冲突', rows: 2 },
+    { path: 'currentBeat', label: '当前节拍', rows: 2 },
+    { path: 'emotionalDirection', label: '情绪方向', rows: 1 },
+    { path: 'doNot', label: '本轮避免（每行一条）', rows: 3, list: true },
+];
+
+const clone = (v) => JSON.parse(JSON.stringify(v));
+const cleanStr = (v, max) => {
+    const t = (typeof v === 'string' ? v : (v == null ? '' : String(v))).replace(/\s+/g, ' ').trim();
+    return t.length > max ? t.slice(0, max) : t;
+};
+
+let plannerBusy = false;
+let planTimer = null;
+
+function freshPlanState() {
+    return {
+        scene: { location: '', participants: '', situation: '', objective: '', conflict: '', emotionalTone: '' },
+        currentBeat: '',
+        emotionalDirection: '',
+        tension: 50,
+        doNot: [],
+        stagnantRounds: 0,
+        lastDecision: '',
+    };
+}
+
+function freshPlanChat() {
+    return {
+        schemaVersion: 1,
+        revision: { amorRevision: 0, lastProcessedMessageIndex: -1 },
+        lastSeenKey: '',
+        roundsSincePlan: 0,
+        directorState: freshPlanState(),
+        snapshots: [],
+        outcomes: [],
+        meta: { createdAt: Date.now(), updatedAt: Date.now() },
+    };
+}
+
+function normalizePlanChat(cd) {
+    const f = freshPlanChat();
+    cd.revision = Object.assign(f.revision, cd.revision || {});
+    cd.directorState = Object.assign(freshPlanState(), cd.directorState || {});
+    cd.directorState.scene = Object.assign(freshPlanState().scene, cd.directorState.scene || {});
+    if (!Array.isArray(cd.directorState.doNot)) cd.directorState.doNot = [];
+    if (!Array.isArray(cd.snapshots)) cd.snapshots = [];
+    if (!Array.isArray(cd.outcomes)) cd.outcomes = [];
+    if (typeof cd.lastSeenKey !== 'string') cd.lastSeenKey = '';
+    if (typeof cd.roundsSincePlan !== 'number') cd.roundsSincePlan = 0;
+    cd.meta = Object.assign(f.meta, cd.meta || {});
+    return cd;
+}
+
+// 数据按「角色 + 聊天」存，同一角色的不同聊天互不串扰（键的规则与 Serendipity 保持一致）
+function currentChatKey() {
+    const c = (this_chid !== undefined && Array.isArray(characters) && characters[this_chid]) ? characters[this_chid] : null;
+    let ck = '';
+    let cid = '';
+    if (c) {
+        if (c.avatar && c.avatar !== 'none') ck = 'avatar::' + c.avatar;
+        else if (c.name) ck = 'name::' + c.name;
+        if (typeof c.chat === 'string' && c.chat) cid = 'chat::' + c.chat;
+    } else if (selected_group) {
+        ck = 'group::' + selected_group;
+    }
+    if (!cid) {
+        const cm = (typeof chat_metadata === 'object' && chat_metadata) ? chat_metadata : null;
+        if (cm && cm.integrity) cid = 'integrity::' + cm.integrity;
+    }
+    return (ck && cid) ? (ck + '::' + cid) : '';
+}
+
+// 取不到聊天标识时返回 null，调用方一律按「不工作」处理，不往库里写脏条目
+function plannerChatData() {
+    const key = currentChatKey();
+    if (!key || !settings || !settings.planner) return null;
+    const chats = settings.planner.chats;
+    if (!chats[key]) chats[key] = freshPlanChat();
+    return normalizePlanChat(chats[key]);
+}
+
+// ---- 聊天文本 ----
+function cleanText(t) {
+    return String(t == null ? '' : t)
+        .replace(/<think>[\s\S]*?<\/think>/gi, '')
+        .replace(/<[^>]+>/g, '')
+        .replace(/\s+\n/g, '\n')
+        .trim();
+}
+function isRealMessage(m) {
+    return !!m && !m.is_system && typeof m.mes === 'string' && m.mes.trim() !== '';
+}
+function lastRealIndex() {
+    if (!Array.isArray(chat)) return -1;
+    for (let i = chat.length - 1; i >= 0; i--) if (isRealMessage(chat[i])) return i;
+    return -1;
+}
+function msgHash(m) { return String(getStringHash(String(m && m.mes || ''))); }
+function buildPlanTranscript(lastIdx) {
+    const rows = [];
+    for (let i = lastIdx; i >= 0 && rows.length < TRANSCRIPT_MESSAGES; i--) {
+        const m = chat[i];
+        if (!isRealMessage(m)) continue;
+        let t = cleanText(m.mes);
+        if (t.length > TRANSCRIPT_CHARS) t = t.slice(0, TRANSCRIPT_CHARS) + '…';
+        rows.unshift((m.name || (m.is_user ? '用户' : '角色')) + (m.is_user ? '（玩家角色）' : '') + '：' + t);
+    }
+    return rows.join('\n\n');
+}
+
+// ---- Serendipity 事实（需要 Serendipity ≥ 2.3.6 才支持预算/分段，旧版返回整段文本也能用） ----
+function serendipityConnected() {
+    return typeof window.Serendipity === 'object' && typeof window.Serendipity.getDirectorContext === 'function';
+}
+function getPlannerFacts() {
+    if (!serendipityConnected()) return '';
+    try {
+        const budget = settings.planner.tokenBudget;
+        const r = window.Serendipity.getDirectorContext({
+            purpose: 'amor',
+            tokenBudget: budget,
+            include: ['storyTime', 'timeline', 'recentMemory', 'characters', 'relationships', 'worldState', 'foreshadows'],
+        });
+        let text = '';
+        if (typeof r === 'string') text = r;
+        else if (r && typeof r.text === 'string') text = r.text;
+        const cap = Math.round(budget * 1.5);
+        return text.length > cap ? text.slice(0, cap) + '…' : text;
+    } catch (e) {
+        console.warn('[Amor] 读取 Serendipity 事实失败，改用聊天上下文：', e);
+        return '';
+    }
+}
+
+// ---- 模型调用（规划专用 API 优先，未设置/失败则用酒馆默认） ----
+function plannerApiConfigured() {
+    const c = settings.planner.api || {};
+    return !!(c.url && c.model);
+}
+function plannerEndpoint(url) {
+    url = String(url || '').trim().replace(/\/+$/, '');
+    if (/\/chat\/completions$/i.test(url)) return url;
+    return url + '/chat/completions';
+}
+function safeErrorText(e, key, max = 120) {
+    let t = String((e && e.message) ? e.message : e);
+    const k = String(key || '').trim();
+    if (k.length >= 6) t = t.split(k).join('***');
+    t = t.replace(/Bearer\s+[A-Za-z0-9._~+\/=-]{6,}/gi, 'Bearer ***')
+        .replace(/\b(sk|rk|pk|ak|key)-[A-Za-z0-9_*-]{6,}/gi, '$1-***')
+        .replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+    return t.length > max ? t.slice(0, max) + '…' : t;
+}
+function withTimeout(p, ms) {
+    let t;
+    const timeout = new Promise((_, rej) => { t = setTimeout(() => rej(new Error('请求超时（' + Math.round(ms / 1000) + ' 秒）')), ms); });
+    return Promise.race([p, timeout]).finally(() => clearTimeout(t));
+}
+async function callPlannerApi({ prompt, systemPrompt }) {
+    const c = settings.planner.api;
+    const headers = { 'Content-Type': 'application/json' };
+    if (c.key) headers.Authorization = 'Bearer ' + c.key.trim();
+    const messages = [];
+    if (systemPrompt) messages.push({ role: 'system', content: systemPrompt });
+    messages.push({ role: 'user', content: prompt });
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), PLAN_TIMEOUT_MS);
+    let res;
+    try {
+        res = await fetch(plannerEndpoint(c.url), {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({ model: c.model.trim(), messages, stream: false }),
+            signal: ctrl.signal,
+        });
+    } catch (e) {
+        if (e && e.name === 'AbortError') throw new Error('请求超时（' + Math.round(PLAN_TIMEOUT_MS / 1000) + ' 秒）');
+        throw new Error(safeErrorText(e, c.key) || '网络请求失败');
+    } finally {
+        clearTimeout(timer);
+    }
+    if (!res.ok) {
+        const t = await res.text().catch(() => '');
+        const detail = safeErrorText(t, c.key);
+        throw new Error('HTTP ' + res.status + (detail ? ' ' + detail : ''));
+    }
+    const d = await res.json();
+    const out = d && d.choices && d.choices[0] && d.choices[0].message && d.choices[0].message.content;
+    if (!out) throw new Error('返回内容为空');
+    return out;
+}
+async function callPlannerLLM({ prompt, systemPrompt }) {
+    if (plannerApiConfigured()) {
+        try {
+            return await callPlannerApi({ prompt, systemPrompt });
+        } catch (e) {
+            const detail = safeErrorText(e, settings.planner.api.key);
+            console.warn('[Amor] 规划专用 API 调用失败，改用酒馆默认 API：', detail);
+            toastr.warning('Amor 规划专用 API 调用失败（' + detail + '），已改用酒馆默认 API');
+        }
+    }
+    return withTimeout(Promise.resolve(generateRaw({ prompt, systemPrompt })), PLAN_TIMEOUT_MS + 60000);
+}
+
+// ---- 规划 ----
+const PLANNER_SYSTEM = `你是一名角色扮演故事的「剧情规划师」。你不写正文，只负责判断剧情现在走到了哪里，并决定下一步应该发生什么。
+
+工作规则：
+1. 已知事实（来自 Serendipity）和聊天里实际发生的内容是事实；你自己的推测和上一轮的计划都不是事实。实际发生的剧情永远优先于上一轮计划。
+2. 先评估：对照「上一轮规划状态」里的当前节拍，看最近剧情里它有没有真的发生，用一句话写出实际发生的具体变化（outcome）。
+3. 再规划：给出场景目标、冲突，以及下一个节拍（nextBeat）。节拍必须是「一个具体的变化」，且至少改变以下之一：信息、人物关系、人物目标、情绪、资源、风险、场景状态。不能写「让剧情继续」「推进感情」这类空话。
+4. 防空转：如果最近几轮只是聊天/吃饭/散步，没有任何变化，把 stagnation 设为 true，并让 nextBeat 引入外部事件、让 NPC 主动行动，或推进某条未完成的线索。
+5. 尊重玩家角色（标注「玩家角色」的人）的自主权：只能制造压力、提供机会、改变环境、让 NPC 行动、提供选择，不能替玩家角色做重大决定（杀人、告白、背叛、接受任务、离开等）。
+6. 自然事件优先于强制剧情；不要直接揭示真相或一次性抖出所有伏笔。
+7. 尊重人物已有的性格、关系和知识范围，不让人物说出自己不可能知道的信息。
+
+只输出一个 JSON 对象，不要任何解释，不要代码块。格式：
+{
+  "outcome": "上一轮实际发生的具体变化，一句话；没有变化就写空字符串",
+  "beatCompleted": true,
+  "scene": {
+    "location": "当前地点",
+    "participants": "在场人物，逗号分隔",
+    "situation": "这一幕正在发生什么，一两句话",
+    "objective": "这一幕应该达成的目标（对剧情的作用，不是结果）",
+    "conflict": "当前的主要冲突或阻力",
+    "emotionalTone": "当前情绪基调"
+  },
+  "nextBeat": "下一个节拍：一个具体的变化",
+  "emotionalDirection": "情绪走向，如：克制 → 怀疑",
+  "tension": 50,
+  "doNot": ["本轮不要做的事，如：直接揭示真相"],
+  "stagnation": false,
+  "reason": "一句话说明你为什么这样安排"
+}
+tension 为 0 到 100 的整数；doNot 最多 4 条。`;
+
+function planStateForPrompt(s) {
+    return JSON.stringify({
+        scene: s.scene,
+        currentBeat: s.currentBeat,
+        emotionalDirection: s.emotionalDirection,
+        tension: s.tension,
+        doNot: s.doNot,
+    }, null, 1);
+}
+
+function buildPlanPrompt(cd, lastIdx) {
+    const facts = getPlannerFacts();
+    const s = cd.directorState;
+    const hasState = !!(s.currentBeat || s.scene.objective || s.scene.situation);
+    const recent = cd.outcomes.slice(-5).map(o => '- ' + o.text).join('\n');
+    return [
+        '【已知事实（来自 Serendipity）】\n' + (facts || '（没有可用的 Serendipity 事实，请只依据最近剧情）'),
+        '【上一轮规划状态】\n' + (hasState ? planStateForPrompt(s) : '（尚无规划状态，这是第一次规划）'),
+        recent ? '【最近几轮的实际结果记录】\n' + recent : '',
+        '【最近剧情】\n' + buildPlanTranscript(lastIdx),
+        '请按规则输出 JSON。',
+    ].filter(Boolean).join('\n\n');
+}
+
+function parsePlanJson(text) {
+    let t = String(text || '').replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+    const fence = t.match(/```(?:json)?\s*([\s\S]*?)```/i);
+    if (fence) t = fence[1].trim();
+    const a = t.indexOf('{');
+    const b = t.lastIndexOf('}');
+    if (a < 0 || b <= a) throw new Error('规划返回的不是 JSON');
+    return JSON.parse(t.slice(a, b + 1));
+}
+
+function applyPlan(cd, plan, msgIndex) {
+    const s = cd.directorState;
+    const outcome = cleanStr(plan.outcome, 200);
+    if (outcome) {
+        cd.outcomes.push({ msgIndex, text: outcome, beatCompleted: plan.beatCompleted !== false });
+        if (cd.outcomes.length > MAX_OUTCOMES) cd.outcomes.splice(0, cd.outcomes.length - MAX_OUTCOMES);
+    }
+    const sc = (plan.scene && typeof plan.scene === 'object') ? plan.scene : {};
+    for (const k of Object.keys(s.scene)) {
+        const v = cleanStr(sc[k], 200);
+        if (v) s.scene[k] = v;
+    }
+    const beat = cleanStr(plan.nextBeat, 200);
+    if (beat) s.currentBeat = beat;
+    const emo = cleanStr(plan.emotionalDirection, 80);
+    if (emo) s.emotionalDirection = emo;
+    const tension = Number(plan.tension);
+    if (Number.isFinite(tension)) s.tension = Math.max(0, Math.min(100, Math.round(tension)));
+    if (Array.isArray(plan.doNot)) s.doNot = plan.doNot.map(x => cleanStr(x, 80)).filter(Boolean).slice(0, 4);
+    s.stagnantRounds = plan.stagnation === true ? (s.stagnantRounds || 0) + 1 : 0;
+    s.lastDecision = cleanStr(plan.reason, 200);
+    cd.revision.amorRevision += 1;
+    cd.revision.lastProcessedMessageIndex = msgIndex;
+    cd.roundsSincePlan = 0;
+    cd.meta.updatedAt = Date.now();
+}
+
+function pushPlanSnapshot(cd, msgIndex) {
+    const m = chat[msgIndex];
+    if (!m) return;
+    cd.snapshots = cd.snapshots.filter(sn => sn.msgIndex !== msgIndex);
+    cd.snapshots.push({ msgIndex, hash: msgHash(m), state: clone(cd.directorState) });
+    if (cd.snapshots.length > MAX_SNAPSHOTS) cd.snapshots.splice(0, cd.snapshots.length - MAX_SNAPSHOTS);
+}
+
+async function runPlanner({ manual = false } = {}) {
+    if (!settings.planner.enabled) { if (manual) toastr.warning('请先开启「剧情规划」'); return; }
+    if (plannerBusy) return;
+    const cd = plannerChatData();
+    if (!cd) { if (manual) toastr.warning('请先打开一个聊天'); return; }
+    const lastIdx = lastRealIndex();
+    if (lastIdx < 0) { if (manual) toastr.warning('当前聊天还没有剧情可供规划'); return; }
+    const hash0 = msgHash(chat[lastIdx]);
+    plannerBusy = true;
+    setPlannerStatus('规划中…');
+    try {
+        const raw = await callPlannerLLM({ systemPrompt: PLANNER_SYSTEM, prompt: buildPlanPrompt(cd, lastIdx) });
+        // 等待期间聊天可能已被删除/重新生成/重置：以返回时的聊天为准，对不上就丢弃这次规划
+        const m = chat[lastIdx];
+        if (!m || msgHash(m) !== hash0 || plannerChatData() !== cd) { setPlannerStatus(''); return; }
+        applyPlan(cd, parsePlanJson(raw), lastIdx);
+        pushPlanSnapshot(cd, lastIdx);
+        saveSettings();
+        updatePlannerInjection();
+        renderPlanner();
+        setPlannerStatus('');
+        if (manual) toastr.success('Amor 已重新规划');
+    } catch (e) {
+        // 规划失败不影响正文生成：沿用上一份规划状态
+        const detail = safeErrorText(e, settings.planner.api.key);
+        console.warn('[Amor] 规划失败：', e);
+        setPlannerStatus('规划失败：' + detail);
+        if (manual) toastr.error('Amor 规划失败：' + detail);
+    } finally {
+        plannerBusy = false;
+    }
+}
+
+// 生成结束后：有新消息才算一轮，按频率触发规划
+function onPlannerGenerationEnded() {
+    if (!settings.planner.enabled || settings.planner.mode !== 'assisted') return;
+    const cd = plannerChatData();
+    if (!cd) return;
+    plannerReconcile();
+    const idx = lastRealIndex();
+    if (idx < 0) return;
+    const m = chat[idx];
+    if (m.is_user) return;
+    const seen = idx + ':' + msgHash(m);
+    if (seen === cd.lastSeenKey) return;
+    cd.lastSeenKey = seen;
+    cd.roundsSincePlan += 1;
+    if (cd.roundsSincePlan < (settings.planner.everyN || 1)) { saveSettings(); return; }
+    clearTimeout(planTimer);
+    planTimer = setTimeout(() => runPlanner(), PLAN_DELAY_MS);
+}
+
+// ---- 回滚（删除消息 / 重新生成 / Swipe / 编辑历史） ----
+function plannerReconcile() {
+    const cd = plannerChatData();
+    if (!cd) return false;
+    const valid = [];
+    for (const sn of cd.snapshots) {
+        const m = chat[sn.msgIndex];
+        if (m && msgHash(m) === sn.hash) valid.push(sn);
+        else break;
+    }
+    if (valid.length === cd.snapshots.length) return false;
+    const last = valid[valid.length - 1];
+    cd.snapshots = valid;
+    cd.directorState = last ? clone(last.state) : freshPlanState();
+    cd.revision.lastProcessedMessageIndex = last ? last.msgIndex : -1;
+    cd.outcomes = cd.outcomes.filter(o => o.msgIndex <= cd.revision.lastProcessedMessageIndex);
+    cd.lastSeenKey = '';
+    cd.revision.amorRevision += 1;
+    saveSettings();
+    updatePlannerInjection();
+    renderPlanner();
+    return true;
+}
+
+// ---- 注入 ----
+function buildPlanBlock(s) {
+    if (!s.currentBeat && !s.scene.objective) return '';
+    const sc = s.scene;
+    const lines = [];
+    if (sc.situation) lines.push('当前场景：' + sc.situation);
+    if (sc.location) lines.push('地点：' + sc.location);
+    if (sc.participants) lines.push('在场人物：' + sc.participants);
+    if (sc.objective) lines.push('场景目标：' + sc.objective);
+    if (sc.conflict) lines.push('当前冲突：' + sc.conflict);
+    if (s.currentBeat) lines.push('本轮应推进的节拍：' + s.currentBeat);
+    if (s.emotionalDirection || sc.emotionalTone) lines.push('情绪方向：' + (s.emotionalDirection || sc.emotionalTone));
+    if (s.stagnantRounds >= 1) lines.push('剧情近期有空转迹象，请让这一轮产生明确的变化。');
+    if (s.doNot.length) lines.push('本轮避免：' + s.doNot.join('；'));
+    return '[Amor 剧情规划]\n' +
+        '以下是对接下来剧情走向的建议，不是既成事实；已发生的剧情和已有设定始终优先。请把它自然地融入叙事，不要生硬点明，也不要一口气写完整个节拍。\n\n' +
+        lines.join('\n') + '\n\n' +
+        '玩家自主权：不得替 {{user}} 做重大决定（杀人、告白、背叛、接受任务、离开等）。可以制造压力、提供机会、改变环境、让其他人物行动，把选择留给 {{user}}。';
+}
+
+function updatePlannerInjection() {
+    let text = '';
+    try {
+        const cd = plannerChatData();
+        if (settings.planner.enabled && settings.planner.mode === 'assisted' && cd) text = buildPlanBlock(cd.directorState);
+    } catch (e) {
+        console.warn('[Amor] 构建规划注入失败：', e);
+    }
+    setExtensionPrompt('amor_story', text, extension_prompt_types.IN_PROMPT, 0);
+}
+
+// ---- 对外接口 ----
+window.Amor = window.Amor || {};
+window.Amor.getStoryDirection = function (opts) {
+    const cd = plannerChatData();
+    if (!cd) return null;
+    const s = cd.directorState;
+    const all = {
+        currentScene: clone(s.scene),
+        currentBeat: s.currentBeat,
+        directorState: clone(s),
+        activeGoals: s.scene.objective ? [s.scene.objective] : [],
+    };
+    const include = opts && Array.isArray(opts.include) ? opts.include : null;
+    const out = { revision: clone(cd.revision) };
+    for (const k of Object.keys(all)) if (!include || include.includes(k)) out[k] = all[k];
+    return out;
+};
+
+// ---- 规划页 ----
+function getPath(s, path) {
+    return path.split('.').reduce((o, k) => (o == null ? o : o[k]), s);
+}
+function setPath(s, path, v) {
+    const ks = path.split('.');
+    const last = ks.pop();
+    const o = ks.reduce((x, k) => x[k], s);
+    o[last] = v;
+}
+
+function plannerPageHtml() {
+    const fieldsHtml = PLAN_FIELDS.map(f => `
+          <div class="amor__p-field">
+            <div class="amor__p-field-label">${f.label}</div>
+            <textarea class="amor__p-text amor__p-input" data-path="${f.path}" rows="${f.rows}" spellcheck="false"></textarea>
+          </div>`).join('');
+    return `
+      <div class="amor__body amor__pbody" data-page="planner" style="display:none">
+        <div class="amor__master">
+          <label class="amor__switch"><input type="checkbox" class="amor__p-enabled"><span class="amor__switch-slider"></span></label>
+          <span class="amor__master-label">剧情规划</span>
+          <span class="amor__master-sep"></span>
+          <select class="amor__p-mode">
+            <option value="assisted">辅助：自动规划并注入</option>
+            <option value="manual">手动：只分析，不注入</option>
+          </select>
+        </div>
+        <div class="amor__auto-ctl">
+          <div class="amor__auto-ctl-row">
+            <button type="button" class="amor__direct-now amor__p-plan">立即规划</button>
+            <button type="button" class="amor__p-reset">重置本聊天规划</button>
+          </div>
+          <div class="amor__auto-ctl-row">
+            <span class="amor__link-status amor__p-link"></span>
+            <span class="amor__p-status"></span>
+          </div>
+        </div>
+
+        <div class="amor__section">
+          <div class="amor__label">当前规划（可直接修改，改完立即生效）</div>
+          <div class="amor__p-tension">
+            <span>张力</span>
+            <div class="amor__p-bar"><i></i></div>
+            <b class="amor__p-tension-val">50</b>
+          </div>
+          <div class="amor__p-warn" style="display:none"></div>
+          ${fieldsHtml}
+          <div class="amor__pacing-hint amor__p-decision"></div>
+        </div>
+
+        <div class="amor__section">
+          <div class="amor__label">实际结果记录</div>
+          <ul class="amor__p-outcomes"></ul>
+        </div>
+
+        <div class="amor__section">
+          <div class="amor__label">规划设置</div>
+          <div class="amor__p-field">
+            <div class="amor__p-field-label">每几轮规划一次</div>
+            <input type="number" class="amor__p-set" data-set="everyN" min="1" max="20">
+          </div>
+          <div class="amor__p-field">
+            <div class="amor__p-field-label">向 Serendipity 索取事实的 token 预算</div>
+            <input type="number" class="amor__p-set" data-set="tokenBudget" min="500" max="8000" step="100">
+          </div>
+          <div class="amor__p-field-label amor__p-sub">规划专用模型（留空则用酒馆当前 API）</div>
+          <div class="amor__p-field"><div class="amor__p-field-label">API 地址（OpenAI 兼容）</div><input type="text" class="amor__p-api" data-api="url" placeholder="https://.../v1" autocomplete="off"></div>
+          <div class="amor__p-field"><div class="amor__p-field-label">API Key</div><input type="password" class="amor__p-api" data-api="key" autocomplete="off"></div>
+          <div class="amor__p-field"><div class="amor__p-field-label">模型名</div><input type="text" class="amor__p-api" data-api="model" autocomplete="off"></div>
+        </div>
+
+        <div class="amor__hint">剧情规划和「导演台」是两件事：导演台调的是「怎么写」（节奏 / 镜头 / 重点），规划决定的是「写什么」——这一幕的目标、冲突和下一个要发生的具体变化。每轮回复结束后，规划会先评估上一个节拍实际发生了什么，再重新规划，并把建议注入下一轮。规划只是建议，不会写入 Serendipity 的事实；删除消息、重新生成、Swipe 时会自动回滚。</div>
+      </div>`;
+}
+
+function bindPlannerEvents() {
+    const panel = $('#st-amor');
+
+    panel.on('click', '.amor__tab', function () {
+        const tab = $(this).data('tab');
+        panel.find('.amor__tab').removeClass('on').filter(this).addClass('on');
+        panel.find('[data-page]').hide().filter(`[data-page="${tab}"]`).show();
+        if (tab === 'planner') renderPlanner();
+    });
+
+    panel.on('change', '.amor__p-enabled', function () {
+        settings.planner.enabled = this.checked;
+        saveSettings();
+        updatePlannerInjection();
+    });
+    panel.on('change', '.amor__p-mode', function () {
+        settings.planner.mode = $(this).val() === 'manual' ? 'manual' : 'assisted';
+        saveSettings();
+        updatePlannerInjection();
+    });
+    panel.on('click', '.amor__p-plan', () => runPlanner({ manual: true }));
+    panel.on('click', '.amor__p-reset', () => {
+        if (!confirm('重置后，本聊天的规划状态和结果记录会清空（Serendipity 的数据不受影响）。继续吗？')) return;
+        const key = currentChatKey();
+        if (!key) return;
+        settings.planner.chats[key] = freshPlanChat();
+        saveSettings();
+        updatePlannerInjection();
+        renderPlanner();
+    });
+    // 手动改字段：写入当前状态，并同步到最新快照，避免之后回滚时把手改的内容冲掉
+    panel.on('change', '.amor__p-input', function () {
+        const cd = plannerChatData();
+        if (!cd) return;
+        const path = $(this).data('path');
+        const f = PLAN_FIELDS.find(x => x.path === path);
+        const raw = $(this).val();
+        const v = f.list ? String(raw).split('\n').map(x => cleanStr(x, 80)).filter(Boolean).slice(0, 4) : cleanStr(raw, 200);
+        setPath(cd.directorState, path, v);
+        const last = cd.snapshots[cd.snapshots.length - 1];
+        if (last) setPath(last.state, path, clone(v));
+        cd.meta.updatedAt = Date.now();
+        saveSettings();
+        updatePlannerInjection();
+    });
+    panel.on('change', '.amor__p-set', function () {
+        const k = $(this).data('set');
+        const n = parseInt($(this).val(), 10);
+        const def = freshPlanner()[k];
+        let v = Number.isFinite(n) ? n : def;
+        if (k === 'everyN') v = Math.max(1, Math.min(20, v));
+        if (k === 'tokenBudget') v = Math.max(500, Math.min(8000, v));
+        settings.planner[k] = v;
+        $(this).val(v);
+        saveSettings();
+    });
+    panel.on('change', '.amor__p-api', function () {
+        settings.planner.api[$(this).data('api')] = String($(this).val()).trim();
+        saveSettings();
+    });
+}
+
+function setPlannerStatus(text) {
+    $('#st-amor .amor__p-status').text(text || '');
+}
+
+function renderPlanner() {
+    const panel = $('#st-amor');
+    if (!panel.length || !settings.planner) return;
+    const p = settings.planner;
+    panel.find('.amor__p-enabled').prop('checked', p.enabled);
+    panel.find('.amor__p-mode').val(p.mode);
+    panel.find('.amor__p-set').each(function () { $(this).val(p[$(this).data('set')]); });
+    panel.find('.amor__p-api').each(function () { $(this).val(p.api[$(this).data('api')] || ''); });
+    panel.find('.amor__p-link')
+        .text(serendipityConnected() ? '已接入 Serendipity 剧情事实' : '未检测到 Serendipity（仅用最近对话）');
+
+    const cd = plannerChatData();
+    if (!cd) {
+        panel.find('.amor__p-input').val('').prop('disabled', true);
+        panel.find('.amor__p-outcomes').empty();
+        panel.find('.amor__p-decision').text('请先打开一个聊天。');
+        return;
+    }
+    const s = cd.directorState;
+    panel.find('.amor__p-input').prop('disabled', false).each(function () {
+        const v = getPath(s, $(this).data('path'));
+        $(this).val(Array.isArray(v) ? v.join('\n') : (v || ''));
+    });
+    panel.find('.amor__p-bar i').css('width', s.tension + '%');
+    panel.find('.amor__p-tension-val').text(s.tension);
+    const warn = panel.find('.amor__p-warn');
+    if (s.stagnantRounds >= 1) warn.text('剧情近期有空转迹象（连续 ' + s.stagnantRounds + ' 轮），下一个节拍会尝试引入变化。').show();
+    else warn.hide();
+    panel.find('.amor__p-decision').text(s.lastDecision ? '规划思路：' + s.lastDecision : '');
+    const ul = panel.find('.amor__p-outcomes').empty();
+    const outs = cd.outcomes.slice(-8).reverse();
+    if (!outs.length) ul.append($('<li class="is-empty">').text('还没有记录。规划几轮后，这里会列出每轮实际发生的变化。'));
+    for (const o of outs) ul.append($('<li>').text(o.text));
+}
+
 // ---------------- 面板 ----------------
 function buildMenuButton() {
     if ($('#st-amor-menu-button').length) return;
@@ -254,12 +902,15 @@ function buildPanel() {
       <div class="amor__head">
         <div class="amor__head-titles">
           <span class="amor__title">Amor</span>
-          <span class="amor__subtitle">导演台</span>
           <span class="amor__version">v${VERSION}</span>
         </div>
         <button type="button" class="amor__close" title="关闭">×</button>
       </div>
-      <div class="amor__body">
+      <div class="amor__tabs">
+        <button type="button" class="amor__tab on" data-tab="director">导演台</button>
+        <button type="button" class="amor__tab" data-tab="planner">剧情规划</button>
+      </div>
+      <div class="amor__body" data-page="director">
         <div class="amor__master">
           <label class="amor__switch"><input type="checkbox" class="amor__enabled"><span class="amor__switch-slider"></span></label>
           <span class="amor__master-label">导演模式</span>
@@ -326,14 +977,17 @@ function buildPanel() {
 
         <div class="amor__hint">导演模式开启后，每次生成都会在角色设定之前注入一段「导演指令」，控制 AI 的节奏 / 镜头 / 叙事重点 / 角色主动性 / 推进速度。指令优先级最高，AI 会照着演。开启「自动导演」后，每轮生成结束 AI 会自动分析剧情、调整下方旋钮并写一句导演指令；若已安装 Serendipity，会自动读取其剧情时间/时间线/人物/关系/世界状态/伏笔作为剧情背景。可点「立即导演」手动分析，或开启「定时自动刷新」按间隔持续分析。</div>
       </div>
+      ${plannerPageHtml()}
     </div>`;
     $('body').append(html);
     bindPanelEvents();
+    bindPlannerEvents();
 }
 
 function renderPanel() {
     const panel = $('#st-amor');
     if (!panel.length) return;
+    renderPlanner();
     panel.find('.amor__enabled').prop('checked', settings.enabled);
     panel.find('.amor__auto').prop('checked', settings.autoDirector);
     panel.toggleClass('amor__on', settings.enabled);
@@ -538,14 +1192,25 @@ jQuery(async () => {
     buildMenuButton();
     buildPanel();
     updatePromptInjection();
+    updatePlannerInjection();
     syncAutoRefreshTimer();
 
     eventSource.on(event_types.CHAT_CHANGED, () => {
-        setTimeout(() => { updatePromptInjection(); }, 100);
+        setTimeout(() => {
+            updatePromptInjection();
+            plannerReconcile();
+            updatePlannerInjection();
+            renderPlanner();
+        }, 100);
     });
+    // 删除消息 / 重新生成 / Swipe：规划状态回滚到仍然有效的最近快照
+    for (const ev of [event_types.MESSAGE_DELETED, event_types.MESSAGE_SWIPED]) {
+        if (ev) eventSource.on(ev, () => setTimeout(() => plannerReconcile(), 200));
+    }
 
     // 每轮生成结束后，自动导演分析剧情并调整下一轮的导演指令
     eventSource.on(event_types.GENERATION_ENDED, () => {
         setTimeout(() => autoDirect(), 300);
+        onPlannerGenerationEnded();
     });
 });
