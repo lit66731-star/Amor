@@ -15,7 +15,7 @@ import { selected_group } from '../../../group-chats.js';
 import { getStringHash } from '../../../utils.js';
 
 const extensionName = 'amor';
-const VERSION = '1.3.2';
+const VERSION = '1.3.3';
 
 // ---------------- 维度常量 ----------------
 const RHYTHMS = ['平缓', '日常', '暧昧', '紧张', '冲突', '高潮', '余波'];
@@ -523,9 +523,9 @@ const PLANNER_SYSTEM = `你是一名角色扮演故事的「剧情规划师」�
     "emotionalTone": "当前情绪基调"
   },
   "nextBeat": "下一个节拍：一个具体的变化",
-  "emotionalDirection": "情绪走向，如：克制 → 怀疑",
+  "emotionalDirection": "情绪走向，用「甲 → 乙」的形式写出起点和终点",
   "tension": 50,
-  "doNot": ["本轮不要做的事，如：直接揭示真相"],
+  "doNot": ["本轮不要做的事，每条一句，最多 4 条"],
   "stagnation": false,
   "reason": "一句话说明你为什么这样安排"
 }
