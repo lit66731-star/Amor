@@ -16,7 +16,7 @@ import { selected_group } from '../../../group-chats.js';
 import { getStringHash } from '../../../utils.js';
 
 const extensionName = 'amor';
-const VERSION = '1.7.1';
+const VERSION = '1.7.2';
 
 // ---------------- 维度常量 ----------------
 const RHYTHMS = ['平缓', '日常', '暧昧', '紧张', '冲突', '高潮', '余波'];
@@ -310,6 +310,9 @@ const DOCTOR_RX_STATUS = { open: '待处理', postponed: '稍后处理', ignored
 const MAX_PRESCRIPTIONS = 4;
 const MAX_DOCTOR_ORDERS = 2;
 const DOCTOR_ORDER_TTL = 3;      // 采纳的医嘱有效的规划次数
+const CHOICE_LV = { high: '高', mid: '中', low: '低' };
+const CHOICE_DIMS = [['progress', '推进'], ['consistency', '人物一致'], ['risk', '风险'], ['reveal', '信息揭示'], ['emotion', '情绪变化']];
+const MAX_CHOICES = 4;
 const ARC_RECENT = 3;           // 最近这么多次规划内发生的情绪变化，才会写进注入
 const THREAD_KINDS = { main: '主线', character: '人物线', world: '世界线' };
 const THREAD_STATUS = { active: '进行中', paused: '暂停', resolved: '已完结' };
@@ -368,6 +371,7 @@ function freshPlanChat() {
         roundsSincePlan: 0,
         directorState: freshPlanState(),
         doctor: null,
+        choices: null,
         snapshots: [],
         outcomes: [],
         meta: { createdAt: Date.now(), updatedAt: Date.now() },
@@ -389,6 +393,7 @@ function normalizePlanChat(cd) {
     if (typeof cd.directorState.beatCause !== 'string') cd.directorState.beatCause = '';
     if (!Array.isArray(cd.directorState.doctorOrders)) cd.directorState.doctorOrders = [];
     if (!cd.doctor || typeof cd.doctor !== 'object' || !Array.isArray(cd.doctor.rx)) cd.doctor = null;
+    if (!cd.choices || typeof cd.choices !== 'object' || !Array.isArray(cd.choices.options)) cd.choices = null;
     if (!Array.isArray(cd.snapshots)) cd.snapshots = [];
     if (!Array.isArray(cd.outcomes)) cd.outcomes = [];
     if (typeof cd.lastSeenKey !== 'string') cd.lastSeenKey = '';
@@ -1111,11 +1116,94 @@ const DOCTOR_SYSTEM = `你是一名角色扮演故事的「故事医生」。你
   "prescriptions": [ { "kind": "event / secret / npc / scene / thread / consequence / other", "title": "八个字以内的标题", "detail": "怎样在场景里自然发生，一两句话" } ]
 }`;
 
-function doctorValid(cd) {
-    const d = cd && cd.doctor;
-    if (!d) return false;
-    const m = chat[d.msgIndex];
-    return !!m && msgHash(m) === d.hash;
+// 会诊 / 选项都是针对某一刻的剧情生成的：对应的消息被删除、重写后就作废
+function anchorValid(r) {
+    if (!r) return false;
+    const m = chat[r.msgIndex];
+    return !!m && msgHash(m) === r.hash;
+}
+function doctorValid(cd) { return !!cd && anchorValid(cd.doctor); }
+function choicesValid(cd) { return !!cd && anchorValid(cd.choices); }
+
+// ---- 选择引擎（Choice Engine）：在需要决定的时刻，为玩家角色列出几个走向不同的选项，并说明各自的取舍。只列选项、不替玩家选 ----
+const CHOICE_SYSTEM = `你是一名角色扮演故事的「选择顾问」。你不写正文，只在用户请求时，为「玩家角色」列出几个走向不同的行动选项，并如实说明每个选项大致会带来什么，由用户自己决定。
+
+工作规则：
+1. 已知事实（来自 Serendipity）和聊天里实际发生的内容是依据，选项必须符合已有设定、玩家角色的性格和他此刻的处境，不得改写事实。
+2. 玩家角色只能依据他自己知道的信息行动：「信息分布」里他不知情的事，不能出现在选项里；他只是怀疑的事，只能表现为试探或猜测。
+3. 给出 3 到 4 个选项，走向要真正不同（例如直接面对、迂回试探、暂缓回避、转向别的事），不要只是同一个行动的不同说法。可以包含保守、拖延或拒绝的选项。
+4. 每个选项的 action 是玩家角色能够直接说出口或做出的一句话行动（第一人称或动作描写均可，一两句话），只写行动本身，不要替他写内心活动、不要预写其他人物的反应或事情的结果。
+5. 如实评估，不要偏袒某一个选项，也不要给出「推荐」。各维度取 high / mid / low：progress 对剧情推进的程度；consistency 与玩家角色性格和既有关系的一致程度；risk 带来冲突、失去机会或关系受损的风险；reveal 会让多少隐藏的信息浮出水面；emotion 会引发多大的情绪变化。foreshadow 写它会触及哪条伏笔（用【伏笔】列表里的标题），没有就写空字符串。note 用一句话说明主要的取舍。
+6. 如果用户给出了「想考虑的问题」，围绕它给出选项；没有就围绕眼下最需要决定的事。眼下并没有需要决定的事时，给出几个自然的下一步行动即可。
+
+只输出一个 JSON 对象，不要任何解释，不要代码块。格式：
+{
+  "focus": "这些选项围绕的决定，一句话",
+  "options": [
+    { "label": "八个字以内的标签", "action": "玩家角色的行动，一两句话", "eval": { "progress": "high / mid / low", "consistency": "high / mid / low", "risk": "high / mid / low", "reveal": "high / mid / low", "emotion": "high / mid / low" }, "foreshadow": "会触及的伏笔标题，没有就留空", "note": "主要取舍，一句话" }
+  ]
+}`;
+function buildChoicePrompt(cd, lastIdx, focus) {
+    const facts = getPlannerFacts();
+    const s = cd.directorState;
+    const hasState = !!(s.currentBeat || s.scene.objective || s.scene.situation);
+    return [
+        '玩家角色：' + (typeof name1 === 'string' && name1 ? name1 : '（未知）'),
+        '【已知事实（来自 Serendipity）】\n' + (facts || '（没有可用的 Serendipity 事实，请只依据最近剧情）'),
+        hasState ? '【当前场景】\n' + planStateForPrompt(s) : '',
+        arcsForPrompt(s) ? '【人物情绪】\n' + arcsForPrompt(s) : '',
+        knowledgeForPrompt(s) ? '【信息分布：谁知道什么】\n' + knowledgeForPrompt(s) : '',
+        consequencesForPrompt(cd, s) ? '【已埋下的后果】\n' + consequencesForPrompt(cd, s) : '',
+        foreshadowsForPrompt(cd, s) ? '【伏笔】\n' + foreshadowsForPrompt(cd, s) : '',
+        focus ? '【想考虑的问题】\n' + focus : '',
+        '【最近剧情】\n' + buildPlanTranscript(lastIdx),
+        '请按规则输出 JSON。',
+    ].filter(Boolean).join('\n\n');
+}
+function applyChoices(cd, raw, lastIdx) {
+    const options = [];
+    for (const o of (Array.isArray(raw.options) ? raw.options : []).slice(0, MAX_CHOICES)) {
+        if (!o || typeof o !== 'object') continue;
+        const action = cleanStr(o.action, 200);
+        if (!action) continue;
+        const ev = (o.eval && typeof o.eval === 'object') ? o.eval : {};
+        const e = {};
+        for (const [k] of CHOICE_DIMS) e[k] = pickKey(ev[k], CHOICE_LV, 'mid');
+        options.push({ id: newThreadId(options), label: cleanStr(o.label, 16) || ('选项' + (options.length + 1)), action, eval: e, foreshadow: cleanStr(o.foreshadow, 40), note: cleanStr(o.note, 100) });
+    }
+    if (options.length < 2) throw new Error('没有生成足够的选项');
+    cd.choices = { msgIndex: lastIdx, hash: msgHash(chat[lastIdx]), at: Date.now(), focus: cleanStr(raw.focus, 120), options };
+}
+let choiceBusy = false;
+async function runChoices(focus) {
+    if (!settings.planner.enabled) { toastr.warning('请先开启「剧情规划」'); return; }
+    if (choiceBusy) return;
+    if (!currentChatKey()) { toastr.warning('请先打开一个聊天'); return; }
+    const lastIdx = lastRealIndex();
+    if (lastIdx < 0) { toastr.warning('当前聊天还没有剧情'); return; }
+    const cd = plannerEnsureChat();
+    syncForeshadowPlan(cd);
+    const hash0 = msgHash(chat[lastIdx]);
+    choiceBusy = true;
+    $('#st-amor .amor__p-choice-run').prop('disabled', true);
+    setPlannerStatus('正在生成选项…');
+    try {
+        const raw = await runExclusive(() => callPlannerLLM({ systemPrompt: CHOICE_SYSTEM, prompt: buildChoicePrompt(cd, lastIdx, focus) }));
+        const m = chat[lastIdx];
+        if (!m || msgHash(m) !== hash0 || plannerChatData() !== cd) { setPlannerStatus(''); return; }
+        applyChoices(cd, parsePlanJson(raw), lastIdx);
+        saveSettings();
+        renderChoices(cd);
+        setPlannerStatus('');
+    } catch (e) {
+        const detail = safeErrorText(e, settings.planner.api.key);
+        console.warn('[Amor] 生成选项失败：', e);
+        setPlannerStatus('生成选项失败：' + detail);
+        toastr.error('生成选项失败：' + detail);
+    } finally {
+        choiceBusy = false;
+        $('#st-amor .amor__p-choice-run').prop('disabled', false);
+    }
 }
 function doctorOrdersForPrompt(cd, s) {
     if (!s.doctorOrders.length) return '';
@@ -1371,6 +1459,7 @@ window.Amor.getStoryDirection = function (opts) {
         emotionalArcs: clone(s.emotionalArcs),
         knowledgeState: clone(s.knowledge),
         foreshadowPlan: clone(s.foreshadowPlan),
+        choices: (cd.choices && choicesValid(cd)) ? clone(cd.choices) : null,
         doctorOrders: clone(s.doctorOrders),
         doctorReport: (cd.doctor && doctorValid(cd)) ? clone(cd.doctor) : null,
         causalChains: { beatCause: s.beatCause, consequences: clone(s.consequences) },
@@ -1436,6 +1525,13 @@ function plannerPageHtml() {
           <div class="amor__label">故事医生（手动会诊：找出剧情不顺的根因，给出可选的修正方向。会调用一次模型）</div>
           <div class="amor__auto-ctl-row"><button type="button" class="amor__direct-now amor__p-doc-run">请医生会诊</button></div>
           <div class="amor__p-doc"></div>
+        </div>
+
+        <div class="amor__section">
+          <div class="amor__label">选择引擎（为玩家角色列出几个走向不同的选项并说明取舍，由你自己选，Amor 不替你决定。会调用一次模型）</div>
+          <div class="amor__p-field"><textarea class="amor__p-text amor__p-choice-focus" rows="2" spellcheck="false" placeholder="想考虑的问题（可留空，默认围绕眼下最需要决定的事）"></textarea></div>
+          <div class="amor__auto-ctl-row"><button type="button" class="amor__direct-now amor__p-choice-run">生成选项</button></div>
+          <div class="amor__p-choices"></div>
         </div>
 
         <div class="amor__section">
@@ -1648,6 +1744,23 @@ function bindPlannerEvents() {
         if (f === 'fact') $(this).val(k.fact);
     });
     panel.on('click', '.amor__p-doc-run', () => runDoctor());
+    panel.on('click', '.amor__p-choice-run', () => runChoices(cleanStr(panel.find('.amor__p-choice-focus').val(), 200)));
+    panel.on('click', '.amor__p-choice-fill, .amor__p-choice-copy', async function () {
+        const cd = plannerChatData();
+        if (!cd || !cd.choices) return;
+        if (!choicesValid(cd)) { cd.choices = null; saveSettings(); renderChoices(cd); return; }
+        const o = cd.choices.options.find(x => x.id === $(this).closest('.amor__p-choice').attr('data-id'));
+        if (!o) return;
+        if ($(this).hasClass('amor__p-choice-copy')) {
+            try { await navigator.clipboard.writeText(o.action); toastr.success('已复制'); } catch (e) { toastr.warning('复制失败，请手动选中文字复制'); }
+            return;
+        }
+        const ta = $('#send_textarea');
+        if (!ta.length) { toastr.warning('找不到输入框'); return; }
+        if (String(ta.val()).trim() && !confirm('输入框里已有内容，要替换成这个选项吗？')) return;
+        ta.val(o.action).trigger('input');
+        toastr.success('已填入输入框，关闭面板后可以修改或直接发送');
+    });
     panel.on('click', '.amor__p-rx-act', function () {
         const cd = plannerChatData();
         if (!cd || !cd.doctor) return;
@@ -1771,6 +1884,29 @@ function renderKnowledge(cd) {
         row.append(lab('知情', list('knownBy', k.knownBy)), lab('怀疑', list('suspectedBy', k.suspectedBy)), lab('不知情', list('unknownBy', k.unknownBy)));
         box.append(row);
     }
+}
+
+function renderChoices(cd) {
+    const box = $('#st-amor .amor__p-choices').empty();
+    if (!cd) { box.append($('<div class="amor__p-empty">').text('请先打开一个聊天。')); return; }
+    if (cd.choices && !choicesValid(cd)) { cd.choices = null; saveSettings(); }
+    const c = cd.choices;
+    if (!c) { box.append($('<div class="amor__p-empty">').text('还没有生成过选项。遇到不知道怎么应对的时刻，点上面的按钮。')); return; }
+    if (c.focus) box.append($('<div class="amor__p-doc-diag">').text('围绕：' + c.focus));
+    for (const o of c.options) {
+        const chips = $('<div class="amor__p-chips">');
+        for (const [k, label] of CHOICE_DIMS) chips.append($('<span class="amor__p-chip">').addClass('lv-' + o.eval[k]).text(label + ' ' + CHOICE_LV[o.eval[k]]));
+        if (o.foreshadow) chips.append($('<span class="amor__p-chip">').text('触及伏笔：' + o.foreshadow));
+        const row = $('<div class="amor__p-thread amor__p-choice">').attr('data-id', o.id);
+        row.append($('<div class="amor__p-th-row">').append($('<b class="amor__p-fa-title">').text(o.label)));
+        row.append($('<div class="amor__p-rx-detail">').text(o.action), chips);
+        if (o.note) row.append($('<div class="amor__p-th-meta">').text(o.note));
+        row.append($('<div class="amor__p-rx-btns">').append(
+            $('<button type="button" class="amor__p-reset amor__p-choice-fill">填入输入框</button>'),
+            $('<button type="button" class="amor__p-reset amor__p-choice-copy">复制</button>')));
+        box.append(row);
+    }
+    box.append($('<div class="amor__pacing-hint">').text('以上只是参考，不分优劣，也没有推荐；怎么选、怎么改，都由你决定。'));
 }
 
 function renderDoctor(cd) {
@@ -1977,6 +2113,7 @@ function renderPlanner() {
         renderForeshadows(null);
         renderConsequences(null);
         renderDoctor(null);
+        renderChoices(null);
         renderInspection(null);
         panel.find('.amor__p-input').val('').prop('disabled', true);
         panel.find('.amor__p-outcomes').empty();
@@ -1990,6 +2127,7 @@ function renderPlanner() {
     renderForeshadows(cd);
     renderConsequences(cd);
     renderDoctor(cd);
+    renderChoices(cd);
     renderInspection(cd);
     panel.find('.amor__p-input').prop('disabled', false).each(function () {
         const v = getPath(s, $(this).data('path'));

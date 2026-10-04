@@ -416,6 +416,12 @@
 #st-amor .amor__p-rx.is-done { opacity: 0.55; }
 #st-amor .amor__p-rx .amor__p-th-row, #st-amor .amor__p-order .amor__p-th-row { flex-wrap: nowrap; }
 
+/* 选择引擎 */
+#st-amor .amor__p-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+#st-amor .amor__p-chip { padding: 2px 8px; font-size: 12px; color: var(--amor-text-soft); border: 1px solid var(--amor-border); border-radius: 10px; }
+#st-amor .amor__p-chip.lv-high { color: var(--amor-text); border-color: var(--amor-accent); }
+#st-amor .amor__p-choice-run:disabled { opacity: 0.5; cursor: default; }
+
 /* 移动端 */
 @media (max-width: 480px) {
     #st-amor .amor__body { padding: 16px 14px 40px; }
