@@ -16,7 +16,7 @@ import { selected_group } from '../../../group-chats.js';
 import { getStringHash } from '../../../utils.js';
 
 const extensionName = 'amor';
-const VERSION = '1.6.0';
+const VERSION = '1.6.1';
 
 // ---------------- 维度常量 ----------------
 const RHYTHMS = ['平缓', '日常', '暧昧', '紧张', '冲突', '高潮', '余波'];
@@ -283,6 +283,9 @@ const MAX_ARCS = 5;
 const MAX_KNOWLEDGE = 8;
 const MAX_KNOW_NAMES = 6;
 const KNOW_CONFIDENCE = { high: '把握大', mid: '一般', low: '把握小' };
+const FORE_STAGE = { sleep: '潜伏', hint: '暗示', build: '铺垫', ready: '可回收' };
+const MAX_FORE = 8;
+const FORE_IDLE_WARN = 6;        // 已安排暗示/铺垫的伏笔，这么多次规划都没被带出，视为久未提及
 const MAX_ARC_HISTORY = 5;
 const ARC_RECENT = 3;           // 最近这么多次规划内发生的情绪变化，才会写进注入
 const THREAD_KINDS = { main: '主线', character: '人物线', world: '世界线' };
@@ -324,6 +327,7 @@ function freshPlanState() {
         beatThread: '',
         emotionalArcs: [],
         knowledge: [],
+        foreshadowPlan: [],
         stagnantRounds: 0,
         lastDecision: '',
     };
@@ -352,6 +356,7 @@ function normalizePlanChat(cd) {
     if (typeof cd.directorState.beatThread !== 'string') cd.directorState.beatThread = '';
     if (!Array.isArray(cd.directorState.emotionalArcs)) cd.directorState.emotionalArcs = [];
     if (!Array.isArray(cd.directorState.knowledge)) cd.directorState.knowledge = [];
+    if (!Array.isArray(cd.directorState.foreshadowPlan)) cd.directorState.foreshadowPlan = [];
     if (!Array.isArray(cd.snapshots)) cd.snapshots = [];
     if (!Array.isArray(cd.outcomes)) cd.outcomes = [];
     if (typeof cd.lastSeenKey !== 'string') cd.lastSeenKey = '';
@@ -708,6 +713,64 @@ function knowledgeForPrompt(s) {
     return s.knowledge.map(k => `- id=${k.id} | ${k.subject}` + (k.fact ? '：' + k.fact : '') + ' | ' + (knowledgeLine(k) || '（尚无记录）') + ' | ' + KNOW_CONFIDENCE[k.confidence]).join('\n');
 }
 
+// ---- 伏笔导演（Foreshadow Director）：伏笔本身归 Serendipity，这里只规划「何时、怎样」铺垫与回收 ----
+function getSerendipityForeshadows() {
+    if (typeof window.Serendipity !== 'object' || typeof window.Serendipity.getForeshadows !== 'function') return null;
+    try {
+        const r = window.Serendipity.getForeshadows();
+        return (r && Array.isArray(r.items)) ? r : null;
+    } catch (e) { return null; }
+}
+// 当前仍未回收的伏笔（以 Serendipity 为准）：id → 条目；取不到返回 null
+function liveForeshadowMap() {
+    const r = getSerendipityForeshadows();
+    if (!r) return null;
+    return new Map(r.items.filter(x => x.status !== '已回收').map(x => [String(x.id), x]));
+}
+// 让规划条目与 Serendipity 对齐：新伏笔加入（默认潜伏），已回收 / 已删除的移除。返回有没有变化
+function syncForeshadowPlan(cd) {
+    const live = liveForeshadowMap();
+    if (!live) return false;
+    const s = cd.directorState;
+    const rev = cd.revision.amorRevision;
+    const before = JSON.stringify(s.foreshadowPlan.map(p => [p.id, p.title]));
+    s.foreshadowPlan = s.foreshadowPlan.filter(p => live.has(String(p.id)));
+    for (const x of live.values()) {
+        const p = s.foreshadowPlan.find(q => String(q.id) === String(x.id));
+        if (p) { p.title = x.title; continue; }
+        if (s.foreshadowPlan.length >= MAX_FORE) continue;
+        s.foreshadowPlan.push({ id: String(x.id), title: x.title, stage: 'sleep', nextHint: '', revealWhen: '', hints: 0, lastHintedAt: rev });
+    }
+    return JSON.stringify(s.foreshadowPlan.map(p => [p.id, p.title])) !== before;
+}
+function mergeForeshadowPlan(cd, s, list) {
+    if (!Array.isArray(list)) return;
+    const rev = cd.revision.amorRevision;
+    for (const raw of list.slice(0, MAX_FORE + 2)) {
+        if (!raw || typeof raw !== 'object') continue;
+        // 只能处理 Serendipity 里已有的伏笔，不新增、不宣布回收
+        const p = findThread(s.foreshadowPlan, raw.id) || findThread(s.foreshadowPlan, raw.title);
+        if (!p) continue;
+        p.stage = pickKey(raw.stage, FORE_STAGE, p.stage);
+        if (typeof raw.nextHint === 'string') p.nextHint = cleanStr(raw.nextHint, 80);
+        if (typeof raw.revealWhen === 'string') p.revealWhen = cleanStr(raw.revealWhen, 80);
+        if (raw.hinted === true) { p.lastHintedAt = rev; p.hints = (p.hints || 0) + 1; }
+    }
+}
+const foreIdle = (cd, p) => Math.max(0, cd.revision.amorRevision - (Number.isFinite(p.lastHintedAt) ? p.lastHintedAt : 0));
+function foreshadowsForPrompt(cd, s) {
+    const live = liveForeshadowMap();
+    if (!live) return '';
+    const rows = s.foreshadowPlan.filter(p => live.has(String(p.id)));
+    if (!rows.length) return '';
+    return rows.map(p => {
+        const x = live.get(String(p.id));
+        return `- id=${p.id} | ${p.title} | 状态：${x.status}` + (x.day != null ? ` | 第${x.day}天埋下` : '') + (x.note ? ' | 备注：' + cleanStr(x.note, 60) : '') +
+            ` | 你的安排：${FORE_STAGE[p.stage]}` + (p.hints ? ` | 已带出${p.hints}次，最近一次在${foreIdle(cd, p)}次规划前` : ' | 还没有带出过') +
+            (p.nextHint ? ' | 铺垫思路：' + p.nextHint : '') + (p.revealWhen ? ' | 回收条件：' + p.revealWhen : '');
+    }).join('\n');
+}
+
 // ---- 规划 ----
 const PLANNER_SYSTEM = `你是一名角色扮演故事的「剧情规划师」。你不写正文，只负责判断剧情现在走到了哪里，并决定下一步应该发生什么。
 
@@ -722,6 +785,7 @@ const PLANNER_SYSTEM = `你是一名角色扮演故事的「剧情规划师」�
 8. 剧情线（threads）是你对故事脉络的归纳（主线、人物线、世界线），是解释，不是事实。只归纳已知事实和实际剧情里确实存在的持续线索；出现新的持续性矛盾、目标或悬念时才新增，不要凭空编造；某条线已经收束就把 status 设为 resolved。已有剧情线必须沿用原 id。每个节拍尽量推进一条剧情线，标注了「需要优先考虑」的线优先。
 9. 情绪弧线（emotionalArcs）关注人物情绪「为什么变化」，不记数值。只为情绪有明显变化、或对接下来的节拍很重要的人物记录（最多 4 人）。current 用一两个词；与上一轮相比发生变化时，cause 必须是剧情里实际发生的具体事件，不能写「剧情需要」。情绪变化要有铺垫，没有足以引发它的事件时，不要让人物情绪突变。玩家角色只记录已经表现出来的情绪，direction 留空。
 10. 知识状态（knowledge）记录「谁知道什么」：世界上存在的信息，不等于每个人物都知道。只记录对剧情有影响的信息差（秘密、隐瞒、误会、尚未公开的真相），最多 8 条。人物只有在剧情里亲眼看到、亲耳听到或被告知后才算「知情」，没有证据不要假定他知道；有迹象但没确认的放进「怀疑」。已知情的人不会忘记。不知情的人物不能说出或表现出自己知道这件事，除非接下来的节拍让他得知；让玩家角色得知信息，只能靠剧情里的线索或他人的行动，不能替玩家角色「想起来」或「领悟」。
+11. 伏笔（foreshadows）本身由 Serendipity 记录，你只规划「何时、怎样」铺垫与回收：只能处理【伏笔】列表里已有的 id，不能新增伏笔，也不能宣布某条伏笔已回收。stage 取值：sleep 暂时不碰；hint 偶尔在细节里轻轻带过；build 可以进一步铺垫；ready 时机成熟，可以创造让它浮出水面的契机。每个节拍最多自然带出一条伏笔，不要直接说破真相，也不要一次抖出多条。回收需要玩家角色做选择或行动时，只能创造契机，不能替玩家完成。nextHint 写「在场景里怎样自然带出」，revealWhen 写「什么条件下可以回收」，都要具体。hinted 表示上一轮实际剧情是否带出了这条伏笔。
 
 只输出一个 JSON 对象，不要任何解释，不要代码块。格式：
 {
@@ -747,12 +811,15 @@ const PLANNER_SYSTEM = `你是一名角色扮演故事的「剧情规划师」�
   "knowledge": [
     { "id": "已有条目填原 id，新条目留空", "subject": "这条信息的主题，简短", "fact": "信息内容，一句话", "knownBy": ["知情的人物"], "suspectedBy": ["怀疑但未确认的人物"], "unknownBy": ["不知情的人物"], "confidence": "high / mid / low（你对这份信息分布的把握）" }
   ],
+  "foreshadows": [
+    { "id": "伏笔列表里的 id", "stage": "sleep / hint / build / ready", "nextHint": "怎样在场景里自然带出，一句话", "revealWhen": "什么条件下可以回收，一句话", "hinted": false }
+  ],
   "tension": 50,
   "doNot": ["本轮不要做的事，每条一句，最多 4 条"],
   "stagnation": false,
   "reason": "一句话说明你为什么这样安排"
 }
-tension 为 0 到 100 的整数；doNot 最多 4 条；knowledge 最多 8 条，threads 最多 8 条，advanced 表示上一轮实际剧情是否推进了这条线，progress 为 0 到 100 的整数。`;
+tension 为 0 到 100 的整数；doNot 最多 4 条；knowledge 最多 8 条，threads 最多 8 条，foreshadows 只列出需要调整安排的伏笔，advanced 表示上一轮实际剧情是否推进了这条线，progress 为 0 到 100 的整数。`;
 
 function planStateForPrompt(s) {
     return JSON.stringify({
@@ -775,6 +842,7 @@ function buildPlanPrompt(cd, lastIdx) {
         threadsForPrompt(cd, s) ? '【当前剧情线（你上一轮维护的）】\n' + threadsForPrompt(cd, s) : '',
         arcsForPrompt(s) ? '【人物情绪弧线（你上一轮维护的）】\n' + arcsForPrompt(s) : '',
         knowledgeForPrompt(s) ? '【信息分布：谁知道什么（你上一轮维护的）】\n' + knowledgeForPrompt(s) : '',
+        foreshadowsForPrompt(cd, s) ? '【伏笔（事实来自 Serendipity，安排是你上一轮维护的）】\n' + foreshadowsForPrompt(cd, s) : '',
         recent ? '【最近几轮的实际结果记录】\n' + recent : '',
         '【最近剧情】\n' + buildPlanTranscript(lastIdx),
         '请按规则输出 JSON。',
@@ -817,6 +885,8 @@ function applyPlan(cd, plan, msgIndex) {
     mergeThreads(cd, s, plan.threads);
     mergeEmotionalArcs(cd, s, plan.emotionalArcs);
     mergeKnowledge(cd, s, plan.knowledge);
+    syncForeshadowPlan(cd);
+    mergeForeshadowPlan(cd, s, plan.foreshadows);
     const bt = findThread(s.threads, plan.beatThread);
     s.beatThread = bt ? bt.id : '';
     cd.roundsSincePlan = 0;
@@ -838,6 +908,7 @@ async function runPlanner({ manual = false } = {}) {
     const lastIdx = lastRealIndex();
     if (lastIdx < 0) { if (manual) toastr.warning('当前聊天还没有剧情可供规划'); return; }
     const cd = plannerEnsureChat();
+    syncForeshadowPlan(cd);
     const hash0 = msgHash(chat[lastIdx]);
     const rev0 = getSerendipityRevision();
     plannerBusy = true;
@@ -952,6 +1023,20 @@ function buildPlanBlock(s, cd) {
         lines.push('信息边界（谁知道什么）：' + pick.map(k => k.subject + (k.fact ? '（' + k.fact + '）' : '') + ' —— ' + knowledgeLine(k)).join('；'));
         lines.push('不知情的人物不能说出或表现出自己知道这些事；怀疑者只能有猜测和试探，不能当作确知；除非本轮剧情让他们得知。');
     }
+    const live = liveForeshadowMap();
+    if (live) {
+        const fp = s.foreshadowPlan.filter(p => live.has(String(p.id)) && p.stage !== 'sleep');
+        const byIdle = (a, b) => (a.lastHintedAt || 0) - (b.lastHintedAt || 0);
+        const soft = fp.filter(p => p.stage === 'hint' || p.stage === 'build').sort(byIdle)[0];
+        const ready = fp.filter(p => p.stage === 'ready').sort(byIdle)[0];
+        const fl = [];
+        if (soft) fl.push('可以在场景细节里自然带出「' + soft.title + '」' + (soft.stage === 'build' ? '（可进一步铺垫）' : '（轻轻带过即可）') + (soft.nextHint ? '：' + soft.nextHint : ''));
+        if (ready) fl.push('「' + ready.title + '」时机已经成熟，可以创造让它浮出水面的契机' + (ready.revealWhen ? '（条件：' + ready.revealWhen + '）' : ''));
+        if (fl.length) {
+            lines.push('伏笔安排：' + fl.join('；'));
+            lines.push('伏笔只能暗示，不要直接说破或一次性揭晓；回收若需要 {{user}} 的选择或行动，只提供契机，不替 {{user}} 完成。');
+        }
+    }
     if (s.emotionalDirection || sc.emotionalTone) lines.push('情绪方向：' + (s.emotionalDirection || sc.emotionalTone));
     if (s.stagnantRounds >= 1) lines.push('剧情近期有空转迹象，请让这一轮产生明确的变化。');
     if (s.doNot.length) lines.push('本轮避免：' + s.doNot.join('；'));
@@ -987,6 +1072,7 @@ window.Amor.getStoryDirection = function (opts) {
         plotThreads: clone(s.threads),
         emotionalArcs: clone(s.emotionalArcs),
         knowledgeState: clone(s.knowledge),
+        foreshadowPlan: clone(s.foreshadowPlan),
     };
     const include = opts && Array.isArray(opts.include) ? opts.include : null;
     const out = { revision: clone(cd.revision) };
@@ -1061,6 +1147,11 @@ function plannerPageHtml() {
           <div class="amor__label">信息分布：谁知道什么（Amor 的判断，不是事实）</div>
           <div class="amor__p-know"></div>
           <button type="button" class="amor__p-reset amor__p-ka-add">+ 添加信息</button>
+        </div>
+
+        <div class="amor__section">
+          <div class="amor__label">伏笔安排（伏笔本身记录在 Serendipity，这里只规划何时、怎样铺垫与回收）</div>
+          <div class="amor__p-fore"></div>
         </div>
 
         <div class="amor__section">
@@ -1141,6 +1232,7 @@ function bindPlannerEvents() {
             last.state.beatThread = cd.directorState.beatThread;
             last.state.emotionalArcs = clone(cd.directorState.emotionalArcs);
             last.state.knowledge = clone(cd.directorState.knowledge);
+            last.state.foreshadowPlan = clone(cd.directorState.foreshadowPlan);
         }
         cd.meta.updatedAt = Date.now();
         saveSettings();
@@ -1228,6 +1320,18 @@ function bindPlannerEvents() {
         if (f === 'subject') $(this).val(k.subject);
         if (f === 'fact') $(this).val(k.fact);
     });
+    panel.on('change', '.amor__p-fa', function () {
+        const cd = plannerEnsureChat();
+        if (!cd) return;
+        syncForeshadowPlan(cd);
+        const p = cd.directorState.foreshadowPlan.find(x => String(x.id) === String($(this).closest('.amor__p-fcard').attr('data-id')));
+        if (!p) return;
+        const f = $(this).data('f');
+        const v = $(this).val();
+        if (f === 'stage') p.stage = pickKey(v, FORE_STAGE, p.stage);
+        else { p[f] = cleanStr(v, 80); $(this).val(p[f]); }
+        syncExtrasToSnapshot(cd);
+    });
     panel.on('change', '.amor__p-th', function () {
         const cd = plannerChatData();
         if (!cd) return;
@@ -1281,6 +1385,31 @@ function renderKnowledge(cd) {
             $('<button type="button" class="amor__p-th-del amor__p-ka-del" title="删除">×</button>')));
         row.append($('<input type="text" class="amor__p-ka amor__p-ea-dir" data-f="fact" maxlength="120" placeholder="信息内容（一句话）" spellcheck="false">').val(k.fact));
         row.append(lab('知情', list('knownBy', k.knownBy)), lab('怀疑', list('suspectedBy', k.suspectedBy)), lab('不知情', list('unknownBy', k.unknownBy)));
+        box.append(row);
+    }
+}
+
+function renderForeshadows(cd) {
+    const box = $('#st-amor .amor__p-fore').empty();
+    if (!cd) { box.append($('<div class="amor__p-empty">').text('请先打开一个聊天。')); return; }
+    const live = liveForeshadowMap();
+    if (!live) { box.append($('<div class="amor__p-empty">').text('需要 Serendipity 2.3.7 或更高版本。')); return; }
+    syncForeshadowPlan(cd);
+    const rows = cd.directorState.foreshadowPlan;
+    if (!rows.length) { box.append($('<div class="amor__p-empty">').text('Serendipity 里还没有未回收的伏笔。在那边添加后，这里会出现对应的安排。')); return; }
+    for (const p of rows) {
+        const x = live.get(String(p.id));
+        const sel = $('<select class="amor__p-fa" data-f="stage">');
+        for (const k of Object.keys(FORE_STAGE)) sel.append($('<option>').val(k).text(FORE_STAGE[k]));
+        sel.val(p.stage);
+        const idle = foreIdle(cd, p);
+        const meta = (x ? x.status : '') + ' · 已带出 ' + (p.hints || 0) + ' 次' + (p.stage !== 'sleep' && idle >= FORE_IDLE_WARN ? ' · ' + idle + ' 次规划没有带出' : '');
+        const lab = (text, input) => $('<label class="amor__p-ka-l">').append($('<span>').text(text), input);
+        const row = $('<div class="amor__p-thread amor__p-fcard">').attr('data-id', p.id).toggleClass('is-idle', p.stage !== 'sleep' && idle >= FORE_IDLE_WARN);
+        row.append($('<div class="amor__p-th-row amor__p-ea-top">').append($('<div class="amor__p-fa-title">').text(p.title), sel));
+        row.append(lab('带出', $('<input type="text" class="amor__p-fa" data-f="nextHint" maxlength="80" placeholder="怎样在场景里自然带出" spellcheck="false">').val(p.nextHint)));
+        row.append(lab('回收', $('<input type="text" class="amor__p-fa" data-f="revealWhen" maxlength="80" placeholder="什么条件下可以回收" spellcheck="false">').val(p.revealWhen)));
+        row.append($('<div class="amor__p-th-meta">').text(meta));
         box.append(row);
     }
 }
@@ -1355,6 +1484,7 @@ function renderPlanner() {
         renderThreads(null);
         renderArcs(null);
         renderKnowledge(null);
+        renderForeshadows(null);
         panel.find('.amor__p-input').val('').prop('disabled', true);
         panel.find('.amor__p-outcomes').empty();
         panel.find('.amor__p-decision').text('请先打开一个聊天。');
@@ -1364,6 +1494,7 @@ function renderPlanner() {
     renderThreads(cd);
     renderArcs(cd);
     renderKnowledge(cd);
+    renderForeshadows(cd);
     panel.find('.amor__p-input').prop('disabled', false).each(function () {
         const v = getPath(s, $(this).data('path'));
         $(this).val(Array.isArray(v) ? v.join('\n') : (v || ''));
