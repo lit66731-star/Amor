@@ -379,6 +379,15 @@
 #st-amor .amor__p-fa-title { flex: 1; min-width: 0; font-size: 13px; line-height: 1.4; word-break: break-all; }
 #st-amor .amor__p-ea-dir { width: 100%; margin-top: 8px; }
 
+/* 故事诊断 */
+#st-amor .amor__p-find {
+    padding: 8px 12px; margin-bottom: 8px; font-size: 13px; line-height: 1.5;
+    border-left: 3px solid var(--amor-border); background: var(--amor-surface); border-radius: 0 8px 8px 0;
+}
+#st-amor .amor__p-find.sev-high { border-left-color: #c96a5a; background: #fbeeeb; }
+#st-amor .amor__p-find.sev-mid { border-left-color: var(--amor-accent); background: var(--amor-accent-soft); }
+#st-amor .amor__p-find-tag { display: inline-block; margin-right: 8px; font-size: 12px; color: var(--amor-text-soft); }
+
 /* 移动端 */
 @media (max-width: 480px) {
     #st-amor .amor__body { padding: 16px 14px 40px; }

@@ -16,7 +16,7 @@ import { selected_group } from '../../../group-chats.js';
 import { getStringHash } from '../../../utils.js';
 
 const extensionName = 'amor';
-const VERSION = '1.6.1';
+const VERSION = '1.6.2';
 
 // ---------------- 维度常量 ----------------
 const RHYTHMS = ['平缓', '日常', '暧昧', '紧张', '冲突', '高潮', '余波'];
@@ -286,6 +286,15 @@ const KNOW_CONFIDENCE = { high: '把握大', mid: '一般', low: '把握小' };
 const FORE_STAGE = { sleep: '潜伏', hint: '暗示', build: '铺垫', ready: '可回收' };
 const MAX_FORE = 8;
 const FORE_IDLE_WARN = 6;        // 已安排暗示/铺垫的伏笔，这么多次规划都没被带出，视为久未提及
+const INSPECT_MIN_REV = 2;       // 规划次数少于这个值时数据太少，不做诊断
+const BEAT_MISS_WARN = 2;        // 节拍连续这么多轮没有真正发生，提醒换切入点
+const TENSION_FLAT_ROUNDS = 4;   // 看最近这么多次规划的张力走势
+const TENSION_FLAT_RANGE = 5;
+const TENSION_HIGH = 85;
+const KNOW_STALE = 10;           // 信息差这么多次规划都没变化，视为停滞
+const FORE_TOO_MANY = 7;
+const INSPECT_AREAS = { pace: '推进', threads: '剧情线', foreshadow: '伏笔', emotion: '人物情绪', knowledge: '信息差', facts: '事实一致' };
+const INSPECT_SEV = { high: '严重', mid: '注意', low: '提示' };
 const MAX_ARC_HISTORY = 5;
 const ARC_RECENT = 3;           // 最近这么多次规划内发生的情绪变化，才会写进注入
 const THREAD_KINDS = { main: '主线', character: '人物线', world: '世界线' };
@@ -771,6 +780,85 @@ function foreshadowsForPrompt(cd, s) {
     }).join('\n');
 }
 
+// ---- 故事巡检（Story Inspector）：纯规则，不调用模型；只指出问题，不修改任何数据 ----
+function serendipityIssueCount() {
+    if (!serendipityConnected()) return 0;
+    try {
+        const r = window.Serendipity.getDirectorContext({ purpose: 'amor', tokenBudget: 600, include: ['consistency'] });
+        const t = r && r.sections && r.sections.consistency;
+        return t ? String(t).split('\n').filter(l => l.trim()).length : 0;
+    } catch (e) { return 0; }
+}
+function inspectStory(cd, { withFacts = true } = {}) {
+    const s = cd.directorState;
+    const rev = cd.revision.amorRevision;
+    const out = [];
+    if (rev < INSPECT_MIN_REV) return out;
+    const add = (area, sev, text) => out.push({ area, sev, text });
+    const names = (arr, n = 3) => arr.slice(0, n).map(x => '「' + x + '」').join('') + (arr.length > n ? '等' : '');
+
+    // 推进
+    if (s.stagnantRounds >= 2) add('pace', 'high', '剧情已连续 ' + s.stagnantRounds + ' 轮空转，没有产生实质变化');
+    else if (s.stagnantRounds === 1) add('pace', 'mid', '剧情近期有空转迹象');
+    let miss = 0;
+    for (let i = cd.outcomes.length - 1; i >= 0 && cd.outcomes[i].beatCompleted === false; i--) miss++;
+    if (miss >= BEAT_MISS_WARN + 1) add('pace', 'high', '规划的节拍已连续 ' + miss + ' 轮没有真正发生，可能不容易落地，或被剧情走向绕开了，考虑换一个切入点');
+    else if (miss >= BEAT_MISS_WARN) add('pace', 'mid', '规划的节拍已连续 ' + miss + ' 轮没有真正发生，可以考虑换一个更容易自然发生的切入点');
+    const ts = cd.snapshots.slice(-TENSION_FLAT_ROUNDS).map(sn => sn.state && sn.state.tension).filter(Number.isFinite);
+    if (ts.length >= TENSION_FLAT_ROUNDS) {
+        if (Math.max(...ts) - Math.min(...ts) <= TENSION_FLAT_RANGE) add('pace', 'low', '张力连续 ' + ts.length + ' 次规划几乎没有起伏（约 ' + ts[ts.length - 1] + '），节奏可能偏平');
+        if (ts.slice(-3).every(t => t >= TENSION_HIGH)) add('pace', 'mid', '张力长时间处于高位，需要一次释放或喘息，否则容易疲劳');
+    }
+
+    // 剧情线
+    const active = s.threads.filter(t => t.status === 'active');
+    if (s.threads.length && !active.length) add('threads', 'mid', '所有剧情线都已暂停或完结，接下来的走向缺少牵引');
+    else if (!s.threads.length && rev >= 4) add('threads', 'low', '尚未归纳出任何剧情线');
+    else if (active.length && !active.some(t => t.kind === 'main')) add('threads', 'low', '没有进行中的主线');
+    const idleHigh = active.filter(t => t.importance === 'high' && threadIdle(cd, t) >= THREAD_IDLE_WARN * 2);
+    const idleMid = active.filter(t => t.importance !== 'low' && !idleHigh.includes(t) && threadIdle(cd, t) >= THREAD_IDLE_WARN);
+    if (idleHigh.length) add('threads', 'high', '重要的剧情线' + names(idleHigh.map(t => t.title)) + '已经很久没有推进');
+    if (idleMid.length) add('threads', 'mid', '剧情线' + names(idleMid.map(t => t.title)) + '久未推进');
+
+    // 伏笔（事实在 Serendipity，这里只看铺垫与回收的节奏）
+    const live = liveForeshadowMap();
+    if (live) {
+        if (live.size >= FORE_TOO_MANY) add('foreshadow', 'mid', '未回收的伏笔有 ' + live.size + ' 条，过多容易被遗忘或互相冲淡，考虑回收其中几条');
+        const fp = s.foreshadowPlan.filter(p => live.has(String(p.id)));
+        const ready = fp.filter(p => p.stage === 'ready' && foreIdle(cd, p) >= 3);
+        if (ready.length) add('foreshadow', 'mid', names(ready.map(p => p.title)) + '时机已经成熟，却迟迟没有创造回收的契机');
+        const stale = fp.filter(p => (p.stage === 'hint' || p.stage === 'build') && foreIdle(cd, p) >= FORE_IDLE_WARN);
+        if (stale.length) add('foreshadow', 'low', names(stale.map(p => p.title)) + '已安排铺垫，但很久没有被带出');
+        if (fp.length && fp.every(p => p.stage === 'sleep') && Math.max(...fp.map(p => foreIdle(cd, p))) >= KNOW_STALE) add('foreshadow', 'low', '所有伏笔都处于潜伏，已经很久没有任何暗示');
+    }
+
+    // 人物情绪
+    const noCause = [], volatile = [];
+    for (const a of s.emotionalArcs) {
+        const h = a.history[a.history.length - 1];
+        if (h && !h.cause && rev - h.at <= ARC_RECENT) noCause.push(a.character);
+        if (a.history.filter(x => rev - x.at <= 3).length >= 3) volatile.push(a.character);
+    }
+    if (noCause.length) add('emotion', 'low', names(noCause) + '的情绪发生了变化，但没有记录到原因，要留意是否突兀');
+    if (volatile.length) add('emotion', 'mid', names(volatile) + '的情绪在短时间内多次转折，容易显得突兀');
+
+    // 信息差
+    const stale = s.knowledge.filter(k => (k.unknownBy.length || k.suspectedBy.length) && rev - k.lastChangedAt >= KNOW_STALE);
+    if (stale.length) add('knowledge', 'low', '关于' + names(stale.map(k => k.subject)) + '的信息差已经很久没有变化，可以让它有所松动（试探、线索或误会）');
+
+    // 事实一致（来自 Serendipity 的一致性检查结果）
+    if (withFacts) {
+        const n = serendipityIssueCount();
+        if (n) add('facts', 'mid', 'Serendipity 里有 ' + n + ' 条待处理的一致性问题');
+    }
+    const rank = { high: 0, mid: 1, low: 2 };
+    return out.sort((a, b) => rank[a.sev] - rank[b.sev]);
+}
+function inspectionForPrompt(cd) {
+    const list = inspectStory(cd).filter(f => f.sev !== 'low').slice(0, 4);
+    return list.map(f => '- [' + INSPECT_AREAS[f.area] + '] ' + f.text).join('\n');
+}
+
 // ---- 规划 ----
 const PLANNER_SYSTEM = `你是一名角色扮演故事的「剧情规划师」。你不写正文，只负责判断剧情现在走到了哪里，并决定下一步应该发生什么。
 
@@ -786,6 +874,7 @@ const PLANNER_SYSTEM = `你是一名角色扮演故事的「剧情规划师」�
 9. 情绪弧线（emotionalArcs）关注人物情绪「为什么变化」，不记数值。只为情绪有明显变化、或对接下来的节拍很重要的人物记录（最多 4 人）。current 用一两个词；与上一轮相比发生变化时，cause 必须是剧情里实际发生的具体事件，不能写「剧情需要」。情绪变化要有铺垫，没有足以引发它的事件时，不要让人物情绪突变。玩家角色只记录已经表现出来的情绪，direction 留空。
 10. 知识状态（knowledge）记录「谁知道什么」：世界上存在的信息，不等于每个人物都知道。只记录对剧情有影响的信息差（秘密、隐瞒、误会、尚未公开的真相），最多 8 条。人物只有在剧情里亲眼看到、亲耳听到或被告知后才算「知情」，没有证据不要假定他知道；有迹象但没确认的放进「怀疑」。已知情的人不会忘记。不知情的人物不能说出或表现出自己知道这件事，除非接下来的节拍让他得知；让玩家角色得知信息，只能靠剧情里的线索或他人的行动，不能替玩家角色「想起来」或「领悟」。
 11. 伏笔（foreshadows）本身由 Serendipity 记录，你只规划「何时、怎样」铺垫与回收：只能处理【伏笔】列表里已有的 id，不能新增伏笔，也不能宣布某条伏笔已回收。stage 取值：sleep 暂时不碰；hint 偶尔在细节里轻轻带过；build 可以进一步铺垫；ready 时机成熟，可以创造让它浮出水面的契机。每个节拍最多自然带出一条伏笔，不要直接说破真相，也不要一次抖出多条。回收需要玩家角色做选择或行动时，只能创造契机，不能替玩家完成。nextHint 写「在场景里怎样自然带出」，revealWhen 写「什么条件下可以回收」，都要具体。hinted 表示上一轮实际剧情是否带出了这条伏笔。
+12. 「巡检发现的问题」是规则检测出的参考，不一定都是真问题。确实存在的，在下一个节拍里用剧情内的方式自然化解，不要为此破坏已有设定、不要替玩家角色做决定；判断不是问题的可以忽略。
 
 只输出一个 JSON 对象，不要任何解释，不要代码块。格式：
 {
@@ -843,6 +932,7 @@ function buildPlanPrompt(cd, lastIdx) {
         arcsForPrompt(s) ? '【人物情绪弧线（你上一轮维护的）】\n' + arcsForPrompt(s) : '',
         knowledgeForPrompt(s) ? '【信息分布：谁知道什么（你上一轮维护的）】\n' + knowledgeForPrompt(s) : '',
         foreshadowsForPrompt(cd, s) ? '【伏笔（事实来自 Serendipity，安排是你上一轮维护的）】\n' + foreshadowsForPrompt(cd, s) : '',
+        inspectionForPrompt(cd) ? '【巡检发现的问题（规则检测，供参考）】\n' + inspectionForPrompt(cd) : '',
         recent ? '【最近几轮的实际结果记录】\n' + recent : '',
         '【最近剧情】\n' + buildPlanTranscript(lastIdx),
         '请按规则输出 JSON。',
@@ -1073,10 +1163,11 @@ window.Amor.getStoryDirection = function (opts) {
         emotionalArcs: clone(s.emotionalArcs),
         knowledgeState: clone(s.knowledge),
         foreshadowPlan: clone(s.foreshadowPlan),
+        inspection: () => inspectStory(cd),
     };
     const include = opts && Array.isArray(opts.include) ? opts.include : null;
     const out = { revision: clone(cd.revision) };
-    for (const k of Object.keys(all)) if (!include || include.includes(k)) out[k] = all[k];
+    for (const k of Object.keys(all)) if (!include || include.includes(k)) out[k] = typeof all[k] === 'function' ? all[k]() : all[k];
     return out;
 };
 
@@ -1117,6 +1208,11 @@ function plannerPageHtml() {
             <span class="amor__link-status amor__p-link"></span>
             <span class="amor__p-status"></span>
           </div>
+        </div>
+
+        <div class="amor__section">
+          <div class="amor__label">故事诊断（规则检测，不调用模型，只提示不改动）</div>
+          <div class="amor__p-inspect"></div>
         </div>
 
         <div class="amor__section">
@@ -1414,6 +1510,19 @@ function renderForeshadows(cd) {
     }
 }
 
+function renderInspection(cd) {
+    const box = $('#st-amor .amor__p-inspect').empty();
+    if (!cd) { box.append($('<div class="amor__p-empty">').text('请先打开一个聊天。')); return; }
+    if (cd.revision.amorRevision < INSPECT_MIN_REV) { box.append($('<div class="amor__p-empty">').text('规划次数还太少，暂时不做诊断。')); return; }
+    const list = inspectStory(cd);
+    if (!list.length) { box.append($('<div class="amor__p-empty">').text('目前没有发现需要留意的问题。')); return; }
+    for (const f of list) {
+        box.append($('<div class="amor__p-find">').addClass('sev-' + f.sev).append(
+            $('<span class="amor__p-find-tag">').text(INSPECT_SEV[f.sev] + ' · ' + INSPECT_AREAS[f.area]),
+            $('<span>').text(f.text)));
+    }
+}
+
 function renderArcs(cd) {
     const box = $('#st-amor .amor__p-arcs').empty();
     if (!cd || !cd.directorState.emotionalArcs.length) {
@@ -1485,6 +1594,7 @@ function renderPlanner() {
         renderArcs(null);
         renderKnowledge(null);
         renderForeshadows(null);
+        renderInspection(null);
         panel.find('.amor__p-input').val('').prop('disabled', true);
         panel.find('.amor__p-outcomes').empty();
         panel.find('.amor__p-decision').text('请先打开一个聊天。');
@@ -1495,6 +1605,7 @@ function renderPlanner() {
     renderArcs(cd);
     renderKnowledge(cd);
     renderForeshadows(cd);
+    renderInspection(cd);
     panel.find('.amor__p-input').prop('disabled', false).each(function () {
         const v = getPath(s, $(this).data('path'));
         $(this).val(Array.isArray(v) ? v.join('\n') : (v || ''));
