@@ -15,7 +15,7 @@ import { selected_group } from '../../../group-chats.js';
 import { getStringHash } from '../../../utils.js';
 
 const extensionName = 'amor';
-const VERSION = '1.3.4';
+const VERSION = '1.4.0';
 
 // ---------------- 维度常量 ----------------
 const RHYTHMS = ['平缓', '日常', '暧昧', '紧张', '冲突', '高潮', '余波'];
@@ -277,6 +277,11 @@ const PLAN_TIMEOUT_MS = 120000;
 const PLAN_INJECT_DEPTH = 1;     // 0 = 最末尾，1 = 倒数第二条之前
 const MAX_SNAPSHOTS = 20;        // 每轮规划留一份快照，用于删除/重生成/Swipe 时回滚（存在酒馆设置里，别留太多）
 const MAX_OUTCOMES = 30;
+const MAX_THREADS = 8;
+const THREAD_KINDS = { main: '主线', character: '人物线', world: '世界线' };
+const THREAD_STATUS = { active: '进行中', paused: '暂停', resolved: '已完结' };
+const THREAD_IMPORTANCE = { high: '高', mid: '中', low: '低' };
+const THREAD_IDLE_WARN = 4;      // 重要的进行中剧情线连续这么多次规划都没推进，就提醒规划师优先处理
 const TRANSCRIPT_MESSAGES = 6;   // 喂给规划的最近消息条数
 const MIN_NEW_CHARS = 150;       // 距上次规划新增的正文少于这个字数、且事实没变化时，跳过规划
 const TRANSCRIPT_CHARS = 1200;   // 单条消息截断长度
@@ -308,6 +313,8 @@ function freshPlanState() {
         emotionalDirection: '',
         tension: 50,
         doNot: [],
+        threads: [],
+        beatThread: '',
         stagnantRounds: 0,
         lastDecision: '',
     };
@@ -332,6 +339,8 @@ function normalizePlanChat(cd) {
     cd.directorState = Object.assign(freshPlanState(), cd.directorState || {});
     cd.directorState.scene = Object.assign(freshPlanState().scene, cd.directorState.scene || {});
     if (!Array.isArray(cd.directorState.doNot)) cd.directorState.doNot = [];
+    if (!Array.isArray(cd.directorState.threads)) cd.directorState.threads = [];
+    if (typeof cd.directorState.beatThread !== 'string') cd.directorState.beatThread = '';
     if (!Array.isArray(cd.snapshots)) cd.snapshots = [];
     if (!Array.isArray(cd.outcomes)) cd.outcomes = [];
     if (typeof cd.lastSeenKey !== 'string') cd.lastSeenKey = '';
@@ -520,6 +529,80 @@ async function callPlannerLLM({ prompt, systemPrompt }) {
     return withTimeout(Promise.resolve(generateRaw({ prompt, systemPrompt })), PLAN_TIMEOUT_MS + 60000);
 }
 
+// ---- 剧情线（Plot Thread）：Amor 对故事脉络的归纳，属于解释，不是事实 ----
+const pickKey = (v, map, def) => (typeof v === 'string' && Object.prototype.hasOwnProperty.call(map, v) ? v : def);
+const clampPct = (v, def) => { const n = Math.round(Number(v)); return Number.isFinite(n) ? Math.max(0, Math.min(100, n)) : def; };
+function newThreadId(threads) {
+    let id;
+    do { id = 't' + Math.random().toString(36).slice(2, 7); } while (threads.some(t => t.id === id));
+    return id;
+}
+function makeThread(threads, rev, init) {
+    return {
+        id: newThreadId(threads),
+        title: cleanStr(init.title, 40) || '新剧情线',
+        kind: pickKey(init.kind, THREAD_KINDS, 'main'),
+        status: pickKey(init.status, THREAD_STATUS, 'active'),
+        importance: pickKey(init.importance, THREAD_IMPORTANCE, 'mid'),
+        progress: clampPct(init.progress, 0),
+        characters: cleanStr(init.characters, 60),
+        lastAdvancedAt: rev,
+    };
+}
+function threadIdle(cd, t) { return Math.max(0, cd.revision.amorRevision - (Number.isFinite(t.lastAdvancedAt) ? t.lastAdvancedAt : 0)); }
+function findThread(threads, ref) {
+    if (!ref) return null;
+    const r = String(ref).trim();
+    return threads.find(t => t.id === r) || threads.find(t => t.title === r) || null;
+}
+function trimThreads(cd, s) {
+    // 完结很久的先清掉
+    s.threads = s.threads.filter(t => !(t.status === 'resolved' && threadIdle(cd, t) >= 5));
+    const rank = { resolved: 0, paused: 1, active: 2 };
+    const imp = { low: 0, mid: 1, high: 2 };
+    while (s.threads.length > MAX_THREADS) {
+        let worst = 0;
+        for (let i = 1; i < s.threads.length; i++) {
+            const a = s.threads[i], b = s.threads[worst];
+            if (rank[a.status] < rank[b.status] || (rank[a.status] === rank[b.status] && imp[a.importance] < imp[b.importance])) worst = i;
+        }
+        s.threads.splice(worst, 1);
+    }
+}
+function mergeThreads(cd, s, list) {
+    if (!Array.isArray(list)) return;
+    const rev = cd.revision.amorRevision;
+    for (const raw of list.slice(0, MAX_THREADS + 2)) {
+        if (!raw || typeof raw !== 'object') continue;
+        const title = cleanStr(raw.title, 40);
+        let t = findThread(s.threads, raw.id) || (title ? s.threads.find(x => x.title === title) : null);
+        if (!t) {
+            if (!title) continue;
+            t = makeThread(s.threads, rev, raw);
+            s.threads.push(t);
+        } else {
+            if (title) t.title = title;
+            t.kind = pickKey(raw.kind, THREAD_KINDS, t.kind);
+            t.status = pickKey(raw.status, THREAD_STATUS, t.status);
+            t.importance = pickKey(raw.importance, THREAD_IMPORTANCE, t.importance);
+            t.progress = clampPct(raw.progress, t.progress);
+            const ch = cleanStr(raw.characters, 60);
+            if (ch) t.characters = ch;
+        }
+        if (raw.advanced === true) t.lastAdvancedAt = rev;
+    }
+    trimThreads(cd, s);
+}
+function threadsForPrompt(cd, s) {
+    if (!s.threads.length) return '';
+    return s.threads.map(t => {
+        const idle = threadIdle(cd, t);
+        return `- id=${t.id} | ${t.title} | ${THREAD_KINDS[t.kind]} | ${THREAD_STATUS[t.status]} | 重要度${THREAD_IMPORTANCE[t.importance]} | 进度${t.progress}%` +
+            (t.characters ? ' | 人物：' + t.characters : '') +
+            (t.status === 'active' ? (idle >= THREAD_IDLE_WARN && t.importance !== 'low' ? ` | 已${idle}次规划没有推进（需要优先考虑）` : (idle ? ` | ${idle}次规划前推进过` : ' | 刚推进过')) : '');
+    }).join('\n');
+}
+
 // ---- 规划 ----
 const PLANNER_SYSTEM = `你是一名角色扮演故事的「剧情规划师」。你不写正文，只负责判断剧情现在走到了哪里，并决定下一步应该发生什么。
 
@@ -531,6 +614,7 @@ const PLANNER_SYSTEM = `你是一名角色扮演故事的「剧情规划师」�
 5. 尊重玩家角色（标注「玩家角色」的人）的自主权：只能制造压力、提供机会、改变环境、让 NPC 行动、提供选择，不能替玩家角色做重大决定（杀人、告白、背叛、接受任务、离开等）。
 6. 自然事件优先于强制剧情；不要直接揭示真相或一次性抖出所有伏笔。
 7. 尊重人物已有的性格、关系和知识范围，不让人物说出自己不可能知道的信息。
+8. 剧情线（threads）是你对故事脉络的归纳（主线、人物线、世界线），是解释，不是事实。只归纳已知事实和实际剧情里确实存在的持续线索；出现新的持续性矛盾、目标或悬念时才新增，不要凭空编造；某条线已经收束就把 status 设为 resolved。已有剧情线必须沿用原 id。每个节拍尽量推进一条剧情线，标注了「需要优先考虑」的线优先。
 
 只输出一个 JSON 对象，不要任何解释，不要代码块。格式：
 {
@@ -545,13 +629,17 @@ const PLANNER_SYSTEM = `你是一名角色扮演故事的「剧情规划师」�
     "emotionalTone": "当前情绪基调"
   },
   "nextBeat": "下一个节拍：一个具体的变化",
+  "beatThread": "下一个节拍主要推进的剧情线（填 id 或标题），没有就留空",
+  "threads": [
+    { "id": "已有剧情线填原 id，新线留空", "title": "剧情线名，简短", "kind": "main / character / world", "status": "active / paused / resolved", "importance": "high / mid / low", "progress": 0, "characters": "相关人物，逗号分隔", "advanced": false }
+  ],
   "emotionalDirection": "情绪走向，用「甲 → 乙」的形式写出起点和终点",
   "tension": 50,
   "doNot": ["本轮不要做的事，每条一句，最多 4 条"],
   "stagnation": false,
   "reason": "一句话说明你为什么这样安排"
 }
-tension 为 0 到 100 的整数；doNot 最多 4 条。`;
+tension 为 0 到 100 的整数；doNot 最多 4 条；threads 最多 8 条，advanced 表示上一轮实际剧情是否推进了这条线，progress 为 0 到 100 的整数。`;
 
 function planStateForPrompt(s) {
     return JSON.stringify({
@@ -571,6 +659,7 @@ function buildPlanPrompt(cd, lastIdx) {
     return [
         '【已知事实（来自 Serendipity）】\n' + (facts || '（没有可用的 Serendipity 事实，请只依据最近剧情）'),
         '【上一轮规划状态】\n' + (hasState ? planStateForPrompt(s) : '（尚无规划状态，这是第一次规划）'),
+        threadsForPrompt(cd, s) ? '【当前剧情线（你上一轮维护的）】\n' + threadsForPrompt(cd, s) : '',
         recent ? '【最近几轮的实际结果记录】\n' + recent : '',
         '【最近剧情】\n' + buildPlanTranscript(lastIdx),
         '请按规则输出 JSON。',
@@ -610,6 +699,9 @@ function applyPlan(cd, plan, msgIndex) {
     s.lastDecision = cleanStr(plan.reason, 200);
     cd.revision.amorRevision += 1;
     cd.revision.lastProcessedMessageIndex = msgIndex;
+    mergeThreads(cd, s, plan.threads);
+    const bt = findThread(s.threads, plan.beatThread);
+    s.beatThread = bt ? bt.id : '';
     cd.roundsSincePlan = 0;
     cd.meta.updatedAt = Date.now();
 }
@@ -707,7 +799,7 @@ function plannerReconcile() {
 }
 
 // ---- 注入 ----
-function buildPlanBlock(s) {
+function buildPlanBlock(s, cd) {
     if (!s.currentBeat && !s.scene.objective) return '';
     const sc = s.scene;
     const lines = [];
@@ -716,7 +808,16 @@ function buildPlanBlock(s) {
     if (sc.participants) lines.push('在场人物：' + sc.participants);
     if (sc.objective) lines.push('场景目标：' + sc.objective);
     if (sc.conflict) lines.push('当前冲突：' + sc.conflict);
-    if (s.currentBeat) lines.push('本轮应推进的节拍：' + s.currentBeat);
+    const bt = findThread(s.threads, s.beatThread);
+    if (s.currentBeat) lines.push('本轮应推进的节拍：' + s.currentBeat + (bt ? '（对应剧情线：' + bt.title + '）' : ''));
+    const active = s.threads.filter(t => t.status === 'active');
+    if (active.length) {
+        const order = { high: 0, mid: 1, low: 2 };
+        const top = active.slice().sort((a, b) => order[a.importance] - order[b.importance]).slice(0, 4);
+        lines.push('进行中的剧情线：' + top.map(t => t.title + '（' + t.progress + '%）').join('；'));
+        const idle = active.filter(t => t.importance !== 'low' && threadIdle(cd, t) >= THREAD_IDLE_WARN && (!bt || bt.id !== t.id));
+        if (idle.length) lines.push('久未推进的剧情线：' + idle.map(t => t.title).join('、') + '（适当让它们在场景里有所体现，不必强行推进）');
+    }
     if (s.emotionalDirection || sc.emotionalTone) lines.push('情绪方向：' + (s.emotionalDirection || sc.emotionalTone));
     if (s.stagnantRounds >= 1) lines.push('剧情近期有空转迹象，请让这一轮产生明确的变化。');
     if (s.doNot.length) lines.push('本轮避免：' + s.doNot.join('；'));
@@ -730,7 +831,7 @@ function updatePlannerInjection() {
     let text = '';
     try {
         const cd = plannerChatData();
-        if (settings.planner.enabled && settings.planner.mode === 'assisted' && cd) text = buildPlanBlock(cd.directorState);
+        if (settings.planner.enabled && settings.planner.mode === 'assisted' && cd) text = buildPlanBlock(cd.directorState, cd);
     } catch (e) {
         console.warn('[Amor] 构建规划注入失败：', e);
     }
@@ -749,6 +850,7 @@ window.Amor.getStoryDirection = function (opts) {
         currentBeat: s.currentBeat,
         directorState: clone(s),
         activeGoals: s.scene.objective ? [s.scene.objective] : [],
+        plotThreads: clone(s.threads),
     };
     const include = opts && Array.isArray(opts.include) ? opts.include : null;
     const out = { revision: clone(cd.revision) };
@@ -805,6 +907,12 @@ function plannerPageHtml() {
           <div class="amor__p-warn" style="display:none"></div>
           ${fieldsHtml}
           <div class="amor__pacing-hint amor__p-decision"></div>
+        </div>
+
+        <div class="amor__section">
+          <div class="amor__label">剧情线（Amor 对故事脉络的归纳，不是事实）</div>
+          <div class="amor__p-threads"></div>
+          <button type="button" class="amor__p-reset amor__p-th-add">+ 添加剧情线</button>
         </div>
 
         <div class="amor__section">
@@ -877,6 +985,49 @@ function bindPlannerEvents() {
         saveSettings();
         updatePlannerInjection();
     });
+    // 剧情线：手动增删改，同步到最新快照，避免回滚时被冲掉
+    const syncThreadsToSnapshot = (cd) => {
+        const last = cd.snapshots[cd.snapshots.length - 1];
+        if (last) { last.state.threads = clone(cd.directorState.threads); last.state.beatThread = cd.directorState.beatThread; }
+        cd.meta.updatedAt = Date.now();
+        saveSettings();
+        updatePlannerInjection();
+    };
+    panel.on('click', '.amor__p-th-add', () => {
+        const cd = plannerEnsureChat();
+        if (!cd) { toastr.warning('请先打开一个聊天'); return; }
+        const th = cd.directorState.threads;
+        if (th.length >= MAX_THREADS) { toastr.warning('剧情线最多 ' + MAX_THREADS + ' 条，请先删除或完结一条'); return; }
+        th.push(makeThread(th, cd.revision.amorRevision, {}));
+        syncThreadsToSnapshot(cd);
+        renderThreads(cd);
+    });
+    panel.on('click', '.amor__p-th-del', function () {
+        const cd = plannerChatData();
+        if (!cd) return;
+        const id = $(this).closest('.amor__p-thread').data('id');
+        cd.directorState.threads = cd.directorState.threads.filter(t => t.id !== id);
+        if (cd.directorState.beatThread === id) cd.directorState.beatThread = '';
+        syncThreadsToSnapshot(cd);
+        renderThreads(cd);
+    });
+    panel.on('change', '.amor__p-th', function () {
+        const cd = plannerChatData();
+        if (!cd) return;
+        const row = $(this).closest('.amor__p-thread');
+        const t = cd.directorState.threads.find(x => x.id === row.data('id'));
+        if (!t) return;
+        const f = $(this).data('f');
+        const v = $(this).val();
+        if (f === 'title') t.title = cleanStr(v, 40) || t.title;
+        else if (f === 'kind') t.kind = pickKey(v, THREAD_KINDS, t.kind);
+        else if (f === 'status') t.status = pickKey(v, THREAD_STATUS, t.status);
+        else if (f === 'importance') t.importance = pickKey(v, THREAD_IMPORTANCE, t.importance);
+        else if (f === 'progress') { t.progress = clampPct(v, t.progress); $(this).val(t.progress); }
+        syncThreadsToSnapshot(cd);
+        if (f === 'title') $(this).val(t.title);
+    });
+
     panel.on('change', '.amor__p-set', function () {
         const k = $(this).data('set');
         const n = parseInt($(this).val(), 10);
@@ -892,6 +1043,33 @@ function bindPlannerEvents() {
         settings.planner.api[$(this).data('api')] = String($(this).val()).trim();
         saveSettings();
     });
+}
+
+function renderThreads(cd) {
+    const box = $('#st-amor .amor__p-threads').empty();
+    if (!cd || !cd.directorState.threads.length) {
+        box.append($('<div class="amor__p-empty">').text(cd ? '还没有剧情线。规划几轮后会自动归纳，也可以手动添加。' : '请先打开一个聊天。'));
+        return;
+    }
+    const sel = (f, map, cur) => {
+        const el = $('<select class="amor__p-th">').attr('data-f', f);
+        for (const k of Object.keys(map)) el.append($('<option>').val(k).text(map[k]));
+        return el.val(cur);
+    };
+    for (const t of cd.directorState.threads) {
+        const idle = threadIdle(cd, t);
+        const meta = t.status !== 'active' ? '' : (idle >= THREAD_IDLE_WARN && t.importance !== 'low' ? idle + ' 次规划没有推进' : (idle ? idle + ' 次规划前推进过' : '刚推进过'));
+        const row = $('<div class="amor__p-thread">').attr('data-id', t.id).toggleClass('is-idle', !!meta && idle >= THREAD_IDLE_WARN && t.importance !== 'low');
+        row.append($('<input type="text" class="amor__p-th amor__p-th-title" data-f="title" maxlength="40" spellcheck="false">').val(t.title));
+        row.append($('<div class="amor__p-th-row">').append(
+            sel('kind', THREAD_KINDS, t.kind), sel('status', THREAD_STATUS, t.status), sel('importance', THREAD_IMPORTANCE, t.importance),
+            $('<input type="number" class="amor__p-th amor__p-th-pct" data-f="progress" min="0" max="100">').val(t.progress),
+            $('<span class="amor__p-th-unit">%</span>'),
+            $('<button type="button" class="amor__p-th-del" title="删除">×</button>')));
+        if (meta) row.append($('<div class="amor__p-th-meta">').text(meta + (t.characters ? ' · ' + t.characters : '')));
+        else if (t.characters) row.append($('<div class="amor__p-th-meta">').text(t.characters));
+        box.append(row);
+    }
 }
 
 function setPlannerStatus(text) {
@@ -911,12 +1089,14 @@ function renderPlanner() {
 
     const cd = currentChatKey() ? (plannerChatData() || freshPlanChat()) : null;
     if (!cd) {
+        renderThreads(null);
         panel.find('.amor__p-input').val('').prop('disabled', true);
         panel.find('.amor__p-outcomes').empty();
         panel.find('.amor__p-decision').text('请先打开一个聊天。');
         return;
     }
     const s = cd.directorState;
+    renderThreads(cd);
     panel.find('.amor__p-input').prop('disabled', false).each(function () {
         const v = getPath(s, $(this).data('path'));
         $(this).val(Array.isArray(v) ? v.join('\n') : (v || ''));
