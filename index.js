@@ -16,7 +16,7 @@ import { selected_group } from '../../../group-chats.js';
 import { getStringHash } from '../../../utils.js';
 
 const extensionName = 'amor';
-const VERSION = '1.5.0';
+const VERSION = '1.6.0';
 
 // ---------------- 维度常量 ----------------
 const RHYTHMS = ['平缓', '日常', '暧昧', '紧张', '冲突', '高潮', '余波'];
@@ -280,6 +280,9 @@ const MAX_SNAPSHOTS = 20;        // 每轮规划留一份快照，用于删除/�
 const MAX_OUTCOMES = 30;
 const MAX_THREADS = 8;
 const MAX_ARCS = 5;
+const MAX_KNOWLEDGE = 8;
+const MAX_KNOW_NAMES = 6;
+const KNOW_CONFIDENCE = { high: '把握大', mid: '一般', low: '把握小' };
 const MAX_ARC_HISTORY = 5;
 const ARC_RECENT = 3;           // 最近这么多次规划内发生的情绪变化，才会写进注入
 const THREAD_KINDS = { main: '主线', character: '人物线', world: '世界线' };
@@ -320,6 +323,7 @@ function freshPlanState() {
         threads: [],
         beatThread: '',
         emotionalArcs: [],
+        knowledge: [],
         stagnantRounds: 0,
         lastDecision: '',
     };
@@ -347,6 +351,7 @@ function normalizePlanChat(cd) {
     if (!Array.isArray(cd.directorState.threads)) cd.directorState.threads = [];
     if (typeof cd.directorState.beatThread !== 'string') cd.directorState.beatThread = '';
     if (!Array.isArray(cd.directorState.emotionalArcs)) cd.directorState.emotionalArcs = [];
+    if (!Array.isArray(cd.directorState.knowledge)) cd.directorState.knowledge = [];
     if (!Array.isArray(cd.snapshots)) cd.snapshots = [];
     if (!Array.isArray(cd.outcomes)) cd.outcomes = [];
     if (typeof cd.lastSeenKey !== 'string') cd.lastSeenKey = '';
@@ -648,6 +653,61 @@ function arcsForPrompt(s) {
     }).join('\n');
 }
 
+// ---- 知识状态（Knowledge State）：世界知道什么，不等于角色知道什么 ----
+const splitNames = (v) => (Array.isArray(v) ? v : String(v == null ? '' : v).split(/[,，、;；\n]+/))
+    .map(x => cleanStr(x, 20)).filter(Boolean);
+const uniqNames = (arr) => Array.from(new Set(arr)).slice(0, MAX_KNOW_NAMES);
+// 一个人只会出现在一栏里：知情 > 怀疑 > 不知情
+function normalizeKnowledge(k) {
+    k.knownBy = uniqNames(k.knownBy);
+    k.suspectedBy = uniqNames(k.suspectedBy.filter(n => !k.knownBy.includes(n)));
+    k.unknownBy = uniqNames(k.unknownBy.filter(n => !k.knownBy.includes(n) && !k.suspectedBy.includes(n)));
+}
+function mergeKnowledge(cd, s, list) {
+    if (!Array.isArray(list)) return;
+    const rev = cd.revision.amorRevision;
+    for (const raw of list.slice(0, MAX_KNOWLEDGE + 2)) {
+        if (!raw || typeof raw !== 'object') continue;
+        const subject = cleanStr(raw.subject, 40);
+        let k = findThread(s.knowledge, raw.id) || (subject ? s.knowledge.find(x => x.subject === subject) : null);
+        const known = splitNames(raw.knownBy), sus = splitNames(raw.suspectedBy), unk = splitNames(raw.unknownBy);
+        if (!k) {
+            if (!subject) continue;
+            k = { id: newThreadId(s.knowledge), subject, fact: cleanStr(raw.fact, 120), knownBy: known, suspectedBy: sus, unknownBy: unk, confidence: pickKey(raw.confidence, KNOW_CONFIDENCE, 'mid'), lastChangedAt: rev };
+            s.knowledge.push(k);
+        } else {
+            // 已经知道的事不会被忘掉（失忆等特殊情况请手动修改）；怀疑 / 不知情以最新判断为准
+            const before = JSON.stringify([k.knownBy, k.suspectedBy, k.unknownBy]);
+            k.knownBy = uniqNames(k.knownBy.concat(known));
+            k.suspectedBy = sus;
+            k.unknownBy = unk;
+            const fact = cleanStr(raw.fact, 120);
+            if (fact) k.fact = fact;
+            k.confidence = pickKey(raw.confidence, KNOW_CONFIDENCE, k.confidence);
+            normalizeKnowledge(k);
+            if (JSON.stringify([k.knownBy, k.suspectedBy, k.unknownBy]) !== before) k.lastChangedAt = rev;
+            continue;
+        }
+        normalizeKnowledge(k);
+    }
+    while (s.knowledge.length > MAX_KNOWLEDGE) {
+        let oldest = 0;
+        for (let i = 1; i < s.knowledge.length; i++) if (s.knowledge[i].lastChangedAt < s.knowledge[oldest].lastChangedAt) oldest = i;
+        s.knowledge.splice(oldest, 1);
+    }
+}
+function knowledgeLine(k) {
+    const parts = [];
+    if (k.knownBy.length) parts.push('知情：' + k.knownBy.join('、'));
+    if (k.suspectedBy.length) parts.push('怀疑：' + k.suspectedBy.join('、'));
+    if (k.unknownBy.length) parts.push('不知情：' + k.unknownBy.join('、'));
+    return parts.join('；');
+}
+function knowledgeForPrompt(s) {
+    if (!s.knowledge.length) return '';
+    return s.knowledge.map(k => `- id=${k.id} | ${k.subject}` + (k.fact ? '：' + k.fact : '') + ' | ' + (knowledgeLine(k) || '（尚无记录）') + ' | ' + KNOW_CONFIDENCE[k.confidence]).join('\n');
+}
+
 // ---- 规划 ----
 const PLANNER_SYSTEM = `你是一名角色扮演故事的「剧情规划师」。你不写正文，只负责判断剧情现在走到了哪里，并决定下一步应该发生什么。
 
@@ -661,6 +721,7 @@ const PLANNER_SYSTEM = `你是一名角色扮演故事的「剧情规划师」�
 7. 尊重人物已有的性格、关系和知识范围，不让人物说出自己不可能知道的信息。
 8. 剧情线（threads）是你对故事脉络的归纳（主线、人物线、世界线），是解释，不是事实。只归纳已知事实和实际剧情里确实存在的持续线索；出现新的持续性矛盾、目标或悬念时才新增，不要凭空编造；某条线已经收束就把 status 设为 resolved。已有剧情线必须沿用原 id。每个节拍尽量推进一条剧情线，标注了「需要优先考虑」的线优先。
 9. 情绪弧线（emotionalArcs）关注人物情绪「为什么变化」，不记数值。只为情绪有明显变化、或对接下来的节拍很重要的人物记录（最多 4 人）。current 用一两个词；与上一轮相比发生变化时，cause 必须是剧情里实际发生的具体事件，不能写「剧情需要」。情绪变化要有铺垫，没有足以引发它的事件时，不要让人物情绪突变。玩家角色只记录已经表现出来的情绪，direction 留空。
+10. 知识状态（knowledge）记录「谁知道什么」：世界上存在的信息，不等于每个人物都知道。只记录对剧情有影响的信息差（秘密、隐瞒、误会、尚未公开的真相），最多 8 条。人物只有在剧情里亲眼看到、亲耳听到或被告知后才算「知情」，没有证据不要假定他知道；有迹象但没确认的放进「怀疑」。已知情的人不会忘记。不知情的人物不能说出或表现出自己知道这件事，除非接下来的节拍让他得知；让玩家角色得知信息，只能靠剧情里的线索或他人的行动，不能替玩家角色「想起来」或「领悟」。
 
 只输出一个 JSON 对象，不要任何解释，不要代码块。格式：
 {
@@ -683,12 +744,15 @@ const PLANNER_SYSTEM = `你是一名角色扮演故事的「剧情规划师」�
   "emotionalArcs": [
     { "character": "人物名", "current": "当前情绪，一两个词", "cause": "与上一轮相比若发生变化，写实际发生的原因，一句话；没变化留空", "direction": "接下来情绪可能的走向，一句话；玩家角色留空" }
   ],
+  "knowledge": [
+    { "id": "已有条目填原 id，新条目留空", "subject": "这条信息的主题，简短", "fact": "信息内容，一句话", "knownBy": ["知情的人物"], "suspectedBy": ["怀疑但未确认的人物"], "unknownBy": ["不知情的人物"], "confidence": "high / mid / low（你对这份信息分布的把握）" }
+  ],
   "tension": 50,
   "doNot": ["本轮不要做的事，每条一句，最多 4 条"],
   "stagnation": false,
   "reason": "一句话说明你为什么这样安排"
 }
-tension 为 0 到 100 的整数；doNot 最多 4 条；threads 最多 8 条，advanced 表示上一轮实际剧情是否推进了这条线，progress 为 0 到 100 的整数。`;
+tension 为 0 到 100 的整数；doNot 最多 4 条；knowledge 最多 8 条，threads 最多 8 条，advanced 表示上一轮实际剧情是否推进了这条线，progress 为 0 到 100 的整数。`;
 
 function planStateForPrompt(s) {
     return JSON.stringify({
@@ -710,6 +774,7 @@ function buildPlanPrompt(cd, lastIdx) {
         '【上一轮规划状态】\n' + (hasState ? planStateForPrompt(s) : '（尚无规划状态，这是第一次规划）'),
         threadsForPrompt(cd, s) ? '【当前剧情线（你上一轮维护的）】\n' + threadsForPrompt(cd, s) : '',
         arcsForPrompt(s) ? '【人物情绪弧线（你上一轮维护的）】\n' + arcsForPrompt(s) : '',
+        knowledgeForPrompt(s) ? '【信息分布：谁知道什么（你上一轮维护的）】\n' + knowledgeForPrompt(s) : '',
         recent ? '【最近几轮的实际结果记录】\n' + recent : '',
         '【最近剧情】\n' + buildPlanTranscript(lastIdx),
         '请按规则输出 JSON。',
@@ -751,6 +816,7 @@ function applyPlan(cd, plan, msgIndex) {
     cd.revision.lastProcessedMessageIndex = msgIndex;
     mergeThreads(cd, s, plan.threads);
     mergeEmotionalArcs(cd, s, plan.emotionalArcs);
+    mergeKnowledge(cd, s, plan.knowledge);
     const bt = findThread(s.threads, plan.beatThread);
     s.beatThread = bt ? bt.id : '';
     cd.roundsSincePlan = 0;
@@ -878,6 +944,14 @@ function buildPlanBlock(s, cd) {
         }).join('；'));
         lines.push('人物情绪的变化要有原因和铺垫，不要无缘由突变。');
     }
+    const gaps = s.knowledge.filter(k => k.unknownBy.length || k.suspectedBy.length);
+    if (gaps.length) {
+        const here = sc.participants || '';
+        const involved = (k) => k.unknownBy.concat(k.suspectedBy).some(n => here.includes(n));
+        const pick = gaps.slice().sort((a, b) => Number(involved(b)) - Number(involved(a))).slice(0, 4);
+        lines.push('信息边界（谁知道什么）：' + pick.map(k => k.subject + (k.fact ? '（' + k.fact + '）' : '') + ' —— ' + knowledgeLine(k)).join('；'));
+        lines.push('不知情的人物不能说出或表现出自己知道这些事；怀疑者只能有猜测和试探，不能当作确知；除非本轮剧情让他们得知。');
+    }
     if (s.emotionalDirection || sc.emotionalTone) lines.push('情绪方向：' + (s.emotionalDirection || sc.emotionalTone));
     if (s.stagnantRounds >= 1) lines.push('剧情近期有空转迹象，请让这一轮产生明确的变化。');
     if (s.doNot.length) lines.push('本轮避免：' + s.doNot.join('；'));
@@ -912,6 +986,7 @@ window.Amor.getStoryDirection = function (opts) {
         activeGoals: s.scene.objective ? [s.scene.objective] : [],
         plotThreads: clone(s.threads),
         emotionalArcs: clone(s.emotionalArcs),
+        knowledgeState: clone(s.knowledge),
     };
     const include = opts && Array.isArray(opts.include) ? opts.include : null;
     const out = { revision: clone(cd.revision) };
@@ -980,6 +1055,12 @@ function plannerPageHtml() {
           <div class="amor__label">人物情绪弧线（Amor 的归纳，不是事实）</div>
           <div class="amor__p-arcs"></div>
           <button type="button" class="amor__p-reset amor__p-ea-add">+ 添加人物情绪</button>
+        </div>
+
+        <div class="amor__section">
+          <div class="amor__label">信息分布：谁知道什么（Amor 的判断，不是事实）</div>
+          <div class="amor__p-know"></div>
+          <button type="button" class="amor__p-reset amor__p-ka-add">+ 添加信息</button>
         </div>
 
         <div class="amor__section">
@@ -1053,12 +1134,13 @@ function bindPlannerEvents() {
         updatePlannerInjection();
     });
     // 剧情线：手动增删改，同步到最新快照，避免回滚时被冲掉
-    const syncThreadsToSnapshot = (cd) => {
+    const syncExtrasToSnapshot = (cd) => {
         const last = cd.snapshots[cd.snapshots.length - 1];
         if (last) {
             last.state.threads = clone(cd.directorState.threads);
             last.state.beatThread = cd.directorState.beatThread;
             last.state.emotionalArcs = clone(cd.directorState.emotionalArcs);
+            last.state.knowledge = clone(cd.directorState.knowledge);
         }
         cd.meta.updatedAt = Date.now();
         saveSettings();
@@ -1070,7 +1152,7 @@ function bindPlannerEvents() {
         const th = cd.directorState.threads;
         if (th.length >= MAX_THREADS) { toastr.warning('剧情线最多 ' + MAX_THREADS + ' 条，请先删除或完结一条'); return; }
         th.push(makeThread(th, cd.revision.amorRevision, {}));
-        syncThreadsToSnapshot(cd);
+        syncExtrasToSnapshot(cd);
         renderThreads(cd);
     });
     panel.on('click', '.amor__p-th-del', function () {
@@ -1079,7 +1161,7 @@ function bindPlannerEvents() {
         const id = $(this).closest('.amor__p-thread').data('id');
         cd.directorState.threads = cd.directorState.threads.filter(t => t.id !== id);
         if (cd.directorState.beatThread === id) cd.directorState.beatThread = '';
-        syncThreadsToSnapshot(cd);
+        syncExtrasToSnapshot(cd);
         renderThreads(cd);
     });
     panel.on('click', '.amor__p-ea-add', () => {
@@ -1088,7 +1170,7 @@ function bindPlannerEvents() {
         const arcs = cd.directorState.emotionalArcs;
         if (arcs.length >= MAX_ARCS) { toastr.warning('最多记录 ' + MAX_ARCS + ' 位人物，请先删除一位'); return; }
         arcs.push({ id: newThreadId(arcs), character: '', current: '', direction: '', history: [], lastChangedAt: cd.revision.amorRevision });
-        syncThreadsToSnapshot(cd);
+        syncExtrasToSnapshot(cd);
         renderArcs(cd);
     });
     panel.on('click', '.amor__p-ea-del', function () {
@@ -1096,7 +1178,7 @@ function bindPlannerEvents() {
         if (!cd) return;
         const id = $(this).closest('.amor__p-arc').data('id');
         cd.directorState.emotionalArcs = cd.directorState.emotionalArcs.filter(a => a.id !== id);
-        syncThreadsToSnapshot(cd);
+        syncExtrasToSnapshot(cd);
         renderArcs(cd);
     });
     panel.on('change', '.amor__p-ea', function () {
@@ -1108,7 +1190,43 @@ function bindPlannerEvents() {
         a[f] = cleanStr($(this).val(), f === 'character' ? 20 : (f === 'current' ? 30 : 60));
         if (f === 'direction' && isPlayerName(a.character)) a.direction = '';
         $(this).val(a[f]);
-        syncThreadsToSnapshot(cd);
+        syncExtrasToSnapshot(cd);
+    });
+    panel.on('click', '.amor__p-ka-add', () => {
+        const cd = plannerEnsureChat();
+        if (!cd) { toastr.warning('请先打开一个聊天'); return; }
+        const ks = cd.directorState.knowledge;
+        if (ks.length >= MAX_KNOWLEDGE) { toastr.warning('最多记录 ' + MAX_KNOWLEDGE + ' 条，请先删除一条'); return; }
+        ks.push({ id: newThreadId(ks), subject: '', fact: '', knownBy: [], suspectedBy: [], unknownBy: [], confidence: 'mid', lastChangedAt: cd.revision.amorRevision });
+        syncExtrasToSnapshot(cd);
+        renderKnowledge(cd);
+    });
+    panel.on('click', '.amor__p-ka-del', function () {
+        const cd = plannerChatData();
+        if (!cd) return;
+        const id = $(this).closest('.amor__p-kcard').data('id');
+        cd.directorState.knowledge = cd.directorState.knowledge.filter(k => k.id !== id);
+        syncExtrasToSnapshot(cd);
+        renderKnowledge(cd);
+    });
+    panel.on('change', '.amor__p-ka', function () {
+        const cd = plannerChatData();
+        if (!cd) return;
+        const k = cd.directorState.knowledge.find(x => x.id === $(this).closest('.amor__p-kcard').data('id'));
+        if (!k) return;
+        const f = $(this).data('f');
+        const v = $(this).val();
+        if (f === 'subject') k.subject = cleanStr(v, 40);
+        else if (f === 'fact') k.fact = cleanStr(v, 120);
+        else if (f === 'confidence') k.confidence = pickKey(v, KNOW_CONFIDENCE, k.confidence);
+        else k[f] = splitNames(v);
+        k.lastChangedAt = cd.revision.amorRevision;
+        normalizeKnowledge(k);
+        syncExtrasToSnapshot(cd);
+        const card = $(this).closest('.amor__p-kcard');
+        for (const key of ['knownBy', 'suspectedBy', 'unknownBy']) card.find(`[data-f="${key}"]`).val(k[key].join('、'));
+        if (f === 'subject') $(this).val(k.subject);
+        if (f === 'fact') $(this).val(k.fact);
     });
     panel.on('change', '.amor__p-th', function () {
         const cd = plannerChatData();
@@ -1123,7 +1241,7 @@ function bindPlannerEvents() {
         else if (f === 'status') t.status = pickKey(v, THREAD_STATUS, t.status);
         else if (f === 'importance') t.importance = pickKey(v, THREAD_IMPORTANCE, t.importance);
         else if (f === 'progress') { t.progress = clampPct(v, t.progress); $(this).val(t.progress); }
-        syncThreadsToSnapshot(cd);
+        syncExtrasToSnapshot(cd);
         if (f === 'title') $(this).val(t.title);
     });
 
@@ -1142,6 +1260,29 @@ function bindPlannerEvents() {
         settings.planner.api[$(this).data('api')] = String($(this).val()).trim();
         saveSettings();
     });
+}
+
+function renderKnowledge(cd) {
+    const box = $('#st-amor .amor__p-know').empty();
+    if (!cd || !cd.directorState.knowledge.length) {
+        box.append($('<div class="amor__p-empty">').text(cd ? '还没有记录。出现秘密、隐瞒或信息差时会自动归纳，也可以手动添加。' : '请先打开一个聊天。'));
+        return;
+    }
+    const lab = (text, input) => $('<label class="amor__p-ka-l">').append($('<span>').text(text), input);
+    const list = (f, arr) => $('<input type="text" class="amor__p-ka" spellcheck="false" placeholder="用顿号或逗号分隔">').attr('data-f', f).val(arr.join('、'));
+    for (const k of cd.directorState.knowledge) {
+        const sel = $('<select class="amor__p-ka" data-f="confidence">');
+        for (const key of Object.keys(KNOW_CONFIDENCE)) sel.append($('<option>').val(key).text(KNOW_CONFIDENCE[key]));
+        sel.val(k.confidence);
+        const row = $('<div class="amor__p-thread amor__p-kcard">').attr('data-id', k.id);
+        row.append($('<div class="amor__p-th-row amor__p-ea-top">').append(
+            $('<input type="text" class="amor__p-ka" data-f="subject" maxlength="40" placeholder="信息主题" spellcheck="false">').val(k.subject),
+            sel,
+            $('<button type="button" class="amor__p-th-del amor__p-ka-del" title="删除">×</button>')));
+        row.append($('<input type="text" class="amor__p-ka amor__p-ea-dir" data-f="fact" maxlength="120" placeholder="信息内容（一句话）" spellcheck="false">').val(k.fact));
+        row.append(lab('知情', list('knownBy', k.knownBy)), lab('怀疑', list('suspectedBy', k.suspectedBy)), lab('不知情', list('unknownBy', k.unknownBy)));
+        box.append(row);
+    }
 }
 
 function renderArcs(cd) {
@@ -1213,6 +1354,7 @@ function renderPlanner() {
     if (!cd) {
         renderThreads(null);
         renderArcs(null);
+        renderKnowledge(null);
         panel.find('.amor__p-input').val('').prop('disabled', true);
         panel.find('.amor__p-outcomes').empty();
         panel.find('.amor__p-decision').text('请先打开一个聊天。');
@@ -1221,6 +1363,7 @@ function renderPlanner() {
     const s = cd.directorState;
     renderThreads(cd);
     renderArcs(cd);
+    renderKnowledge(cd);
     panel.find('.amor__p-input').prop('disabled', false).each(function () {
         const v = getPath(s, $(this).data('path'));
         $(this).val(Array.isArray(v) ? v.join('\n') : (v || ''));
