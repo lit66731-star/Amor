@@ -15,7 +15,7 @@ import { selected_group } from '../../../group-chats.js';
 import { getStringHash } from '../../../utils.js';
 
 const extensionName = 'amor';
-const VERSION = '1.3.1';
+const VERSION = '1.3.2';
 
 // ---------------- 维度常量 ----------------
 const RHYTHMS = ['平缓', '日常', '暧昧', '紧张', '冲突', '高潮', '余波'];
@@ -149,6 +149,14 @@ function updatePromptInjection() {
     );
 }
 
+// 所有后台模型调用（自动导演、剧情规划）排队执行，避免同一轮生成结束后两路请求同时发出
+let llmChain = Promise.resolve();
+function runExclusive(fn) {
+    const p = llmChain.then(fn, fn);
+    llmChain = p.catch(() => {});
+    return p;
+}
+
 // ---------------- 自动导演（AI 分析剧情 → 生成并应用导演指令） ----------------
 const DIRECTOR_PROMPT = `你是 Amor 导演台的剧情导演。根据下面给的剧情背景与最近剧情，判断下一段剧情该怎么导：节奏、镜头、叙事重点、角色主动性、推进速度，并写一句具体的导演指令。
 
@@ -181,11 +189,13 @@ function buildTranscript() {
 }
 
 // 读取 Serendipity 的剧情上下文（已安装则给导演完整故事背景，否则为空 → 只用最近对话）
+const LEGACY_CONTEXT_BUDGET = 2500;
 function getStoryContext() {
     try {
         if (typeof window.Serendipity === 'object' && typeof window.Serendipity.getDirectorContext === 'function') {
-            const c = window.Serendipity.getDirectorContext();
-            if (c && c.trim()) return c;
+            const r = window.Serendipity.getDirectorContext({ purpose: 'amor', tokenBudget: LEGACY_CONTEXT_BUDGET });
+            const c = typeof r === 'string' ? r : (r && typeof r.text === 'string' ? r.text : '');
+            if (c && c.trim()) return c.length > LEGACY_CONTEXT_BUDGET * 1.5 ? c.slice(0, Math.round(LEGACY_CONTEXT_BUDGET * 1.5)) + '…' : c;
         }
     } catch (e) {}
     return '';
@@ -232,7 +242,7 @@ async function autoDirect() {
         const ctx = getStoryContext();
         const contextBlock = ctx ? '剧情背景（整个故事的当前状态，导戏时注意与它保持一致）：\n' + ctx + '\n\n' : '';
         const prompt = DIRECTOR_PROMPT.replace('{contextBlock}', contextBlock).replace('{transcript}', transcript);
-        const result = await generateRaw({ prompt, systemPrompt: '你是一位专业的剧情导演，只负责决定下一段剧情怎么导。' });
+        const result = await runExclusive(() => generateRaw({ prompt, systemPrompt: '你是一位专业的剧情导演，只负责决定下一段剧情怎么导。' }));
         const d = parseDirectorOutput(result);
         settings.rhythm = d.rhythm;
         settings.camera = d.camera;
@@ -601,7 +611,8 @@ async function runPlanner({ manual = false } = {}) {
     plannerBusy = true;
     setPlannerStatus('规划中…');
     try {
-        const raw = await callPlannerLLM({ systemPrompt: PLANNER_SYSTEM, prompt: buildPlanPrompt(cd, lastIdx) });
+        const planPrompt = buildPlanPrompt(cd, lastIdx);
+        const raw = await runExclusive(() => callPlannerLLM({ systemPrompt: PLANNER_SYSTEM, prompt: planPrompt }));
         // 等待期间聊天可能已被删除/重新生成/重置：以返回时的聊天为准，对不上就丢弃这次规划
         const m = chat[lastIdx];
         if (!m || msgHash(m) !== hash0 || plannerChatData() !== cd) { setPlannerStatus(''); return; }
