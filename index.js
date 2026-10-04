@@ -16,7 +16,7 @@ import { selected_group } from '../../../group-chats.js';
 import { getStringHash } from '../../../utils.js';
 
 const extensionName = 'amor';
-const VERSION = '1.7.2';
+const VERSION = '1.8.0';
 
 // ---------------- 维度常量 ----------------
 const RHYTHMS = ['平缓', '日常', '暧昧', '紧张', '冲突', '高潮', '余波'];
@@ -58,6 +58,7 @@ function freshPlanner() {
         enabled: false,
         mode: 'assisted',      // assisted 自动规划并注入 | manual 只分析不注入
         everyN: 1,             // 每几轮规划一次
+        urgentReplan: true,    // 巡检发现严重问题 / 节拍屡次落空时，不等 everyN 提前重规划
         tokenBudget: 2500,     // 向 Serendipity 索取事实的预算
         api: { url: '', key: '', model: '' },   // 规划专用模型，留空则用酒馆当前 API
         chats: {},             // 按「角色 + 聊天」分开存的规划状态
@@ -92,6 +93,7 @@ function loadSettings() {
     if (typeof p.enabled !== 'boolean') p.enabled = false;
     if (p.mode !== 'manual') p.mode = 'assisted';
     if (!Number.isFinite(p.everyN) || p.everyN < 1) p.everyN = pdef.everyN;
+    if (typeof p.urgentReplan !== 'boolean') p.urgentReplan = pdef.urgentReplan;
     if (!Number.isFinite(p.tokenBudget) || p.tokenBudget < 500) p.tokenBudget = pdef.tokenBudget;
     if (!p.chats || typeof p.chats !== 'object' || Array.isArray(p.chats)) p.chats = {};
     // 1.3.0 会给打开过的每个聊天建空档，这里清掉从未产生过内容的空条目
@@ -287,6 +289,7 @@ const FORE_STAGE = { sleep: '潜伏', hint: '暗示', build: '铺垫', ready: '�
 const MAX_FORE = 8;
 const FORE_IDLE_WARN = 6;        // 已安排暗示/铺垫的伏笔，这么多次规划都没被带出，视为久未提及
 const INSPECT_MIN_REV = 2;       // 规划次数少于这个值时数据太少，不做诊断
+const URGENT_COOLDOWN = 2;       // 提前重规划之后，至少隔这么多次规划才能再次提前触发
 const BEAT_MISS_WARN = 2;        // 节拍连续这么多轮没有真正发生，提醒换切入点
 const TENSION_FLAT_ROUNDS = 4;   // 看最近这么多次规划的张力走势
 const TENSION_FLAT_RANGE = 5;
@@ -369,6 +372,7 @@ function freshPlanChat() {
         revision: { amorRevision: 0, lastProcessedMessageIndex: -1, serendipityRevision: '' },
         lastSeenKey: '',
         roundsSincePlan: 0,
+        lastUrgentRev: -99,
         directorState: freshPlanState(),
         doctor: null,
         choices: null,
@@ -398,6 +402,7 @@ function normalizePlanChat(cd) {
     if (!Array.isArray(cd.outcomes)) cd.outcomes = [];
     if (typeof cd.lastSeenKey !== 'string') cd.lastSeenKey = '';
     if (typeof cd.roundsSincePlan !== 'number') cd.roundsSincePlan = 0;
+    if (typeof cd.lastUrgentRev !== 'number') cd.lastUrgentRev = -99;
     cd.meta = Object.assign(f.meta, cd.meta || {});
     return cd;
 }
@@ -861,6 +866,21 @@ function serendipityIssueCount() {
         return t ? String(t).split('\n').filter(l => l.trim()).length : 0;
     } catch (e) { return 0; }
 }
+function beatMissCount(cd) {
+    let miss = 0;
+    for (let i = cd.outcomes.length - 1; i >= 0 && cd.outcomes[i].beatCompleted === false; i--) miss++;
+    return miss;
+}
+// 需要提前重规划的理由（纯规则，没有就返回空字符串）：巡检里有严重问题，或节拍连续落空
+function urgentReason(cd) {
+    if (!settings.planner.urgentReplan) return '';
+    if (cd.revision.amorRevision < INSPECT_MIN_REV) return '';
+    const high = inspectStory(cd, { withFacts: false }).filter(f => f.sev === 'high');
+    if (high.length) return high[0].text;
+    const miss = beatMissCount(cd);
+    if (miss >= BEAT_MISS_WARN) return '规划的节拍已连续 ' + miss + ' 轮没有真正发生';
+    return '';
+}
 function inspectStory(cd, { withFacts = true } = {}) {
     const s = cd.directorState;
     const rev = cd.revision.amorRevision;
@@ -872,8 +892,7 @@ function inspectStory(cd, { withFacts = true } = {}) {
     // 推进
     if (s.stagnantRounds >= 2) add('pace', 'high', '剧情已连续 ' + s.stagnantRounds + ' 轮空转，没有产生实质变化');
     else if (s.stagnantRounds === 1) add('pace', 'mid', '剧情近期有空转迹象');
-    let miss = 0;
-    for (let i = cd.outcomes.length - 1; i >= 0 && cd.outcomes[i].beatCompleted === false; i--) miss++;
+    const miss = beatMissCount(cd);
     if (miss >= BEAT_MISS_WARN + 1) add('pace', 'high', '规划的节拍已连续 ' + miss + ' 轮没有真正发生，可能不容易落地，或被剧情走向绕开了，考虑换一个切入点');
     else if (miss >= BEAT_MISS_WARN) add('pace', 'mid', '规划的节拍已连续 ' + miss + ' 轮没有真正发生，可以考虑换一个更容易自然发生的切入点');
     const ts = cd.snapshots.slice(-TENSION_FLAT_ROUNDS).map(sn => sn.state && sn.state.tension).filter(Number.isFinite);
@@ -1022,7 +1041,7 @@ function planStateForPrompt(s) {
     }, null, 1);
 }
 
-function buildPlanPrompt(cd, lastIdx) {
+function buildPlanPrompt(cd, lastIdx, urgent) {
     const facts = getPlannerFacts();
     const s = cd.directorState;
     const hasState = !!(s.currentBeat || s.scene.objective || s.scene.situation);
@@ -1039,6 +1058,7 @@ function buildPlanPrompt(cd, lastIdx) {
         inspectionForPrompt(cd) ? '【巡检发现的问题（规则检测，供参考）】\n' + inspectionForPrompt(cd) : '',
         recent ? '【最近几轮的实际结果记录】\n' + recent : '',
         '【最近剧情】\n' + buildPlanTranscript(lastIdx),
+        urgent ? '【本次规划需要重点处理】问题：' + urgent + '。请直接针对这个问题调整本轮规划：换一个更容易自然发生的切入点，不要重复上一个节拍的写法；仍然不要替玩家角色做决定。' : '',
         '请按规则输出 JSON。',
     ].filter(Boolean).join('\n\n');
 }
@@ -1277,7 +1297,7 @@ async function runDoctor() {
     }
 }
 
-async function runPlanner({ manual = false } = {}) {
+async function runPlanner({ manual = false, urgent = '' } = {}) {
     if (!settings.planner.enabled) { if (manual) toastr.warning('请先开启「剧情规划」'); return; }
     if (plannerBusy) return;
     if (!currentChatKey()) { if (manual) toastr.warning('请先打开一个聊天'); return; }
@@ -1288,9 +1308,9 @@ async function runPlanner({ manual = false } = {}) {
     const hash0 = msgHash(chat[lastIdx]);
     const rev0 = getSerendipityRevision();
     plannerBusy = true;
-    setPlannerStatus('规划中…');
+    setPlannerStatus(urgent ? '规划中（针对：' + cleanStr(urgent, 30) + '）…' : '规划中…');
     try {
-        const planPrompt = buildPlanPrompt(cd, lastIdx);
+        const planPrompt = buildPlanPrompt(cd, lastIdx, urgent);
         const raw = await runExclusive(() => callPlannerLLM({ systemPrompt: PLANNER_SYSTEM, prompt: planPrompt }));
         // 等待期间聊天可能已被删除/重新生成/重置：以返回时的聊天为准，对不上就丢弃这次规划
         const m = chat[lastIdx];
@@ -1328,14 +1348,19 @@ function onPlannerGenerationEnded() {
     if (seen === cd.lastSeenKey) return;
     cd.lastSeenKey = seen;
     cd.roundsSincePlan += 1;
-    if (cd.roundsSincePlan < (settings.planner.everyN || 1)) { saveSettings(); return; }
+    const due = cd.roundsSincePlan >= (settings.planner.everyN || 1);
+    const rev = cd.revision.amorRevision;
+    const reason = urgentReason(cd);
+    const early = !due && !!reason && (cd.lastUrgentRev > rev || rev - cd.lastUrgentRev >= URGENT_COOLDOWN);
+    if (!due && !early) { saveSettings(); return; }
+    if (reason) cd.lastUrgentRev = rev;
     if (!plannerWorthRunning(cd, idx)) {
         saveSettings();
         setPlannerStatus('新增内容很少且事实无变化，已跳过本轮规划');
         return;
     }
     clearTimeout(planTimer);
-    planTimer = setTimeout(() => runPlanner(), PLAN_DELAY_MS);
+    planTimer = setTimeout(() => runPlanner({ urgent: reason }), PLAN_DELAY_MS);
 }
 
 // ---- 回滚（删除消息 / 重新生成 / Swipe / 编辑历史） ----
@@ -1585,6 +1610,9 @@ function plannerPageHtml() {
           <div class="amor__p-field">
             <div class="amor__p-field-label">每几轮规划一次</div>
             <input type="number" class="amor__p-set" data-set="everyN" min="1" max="20">
+          </div>
+          <div class="amor__p-field">
+            <label class="amor__auto-ctl-row"><span class="amor__switch amor__switch--sm"><input type="checkbox" class="amor__p-urgent"><span class="amor__switch-slider"></span></span><span class="amor__auto-ctl-label">发现严重问题时提前重新规划（不必等到下一个规划周期）</span></label>
           </div>
           <div class="amor__p-field">
             <div class="amor__p-field-label">向 Serendipity 索取事实的 token 预算</div>
@@ -1857,6 +1885,10 @@ function bindPlannerEvents() {
         $(this).val(v);
         saveSettings();
     });
+    panel.on('change', '.amor__p-urgent', function () {
+        settings.planner.urgentReplan = $(this).prop('checked');
+        saveSettings();
+    });
     panel.on('change', '.amor__p-api', function () {
         settings.planner.api[$(this).data('api')] = String($(this).val()).trim();
         saveSettings();
@@ -2100,6 +2132,7 @@ function renderPlanner() {
     const p = settings.planner;
     panel.find('.amor__p-enabled').prop('checked', p.enabled);
     panel.find('.amor__p-mode').val(p.mode);
+    panel.find('.amor__p-urgent').prop('checked', p.urgentReplan);
     panel.find('.amor__p-set').each(function () { $(this).val(p[$(this).data('set')]); });
     panel.find('.amor__p-api').each(function () { $(this).val(p.api[$(this).data('api')] || ''); });
     panel.find('.amor__p-link')
