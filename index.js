@@ -17,7 +17,7 @@ import { selected_group } from '../../../group-chats.js';
 import { getStringHash } from '../../../utils.js';
 
 const extensionName = 'amor';
-const VERSION = '1.10.1';
+const VERSION = '1.10.2';
 
 // ---------------- 维度常量 ----------------
 const RHYTHMS = ['平缓', '日常', '暧昧', '紧张', '冲突', '高潮', '余波'];
@@ -1816,6 +1816,7 @@ function bindPlannerEvents() {
         panel.find('.amor__tab').removeClass('on').filter(this).addClass('on');
         panel.find('[data-page]').hide().filter(`[data-page="${tab}"]`).show();
         if (tab === 'planner') renderPlanner();
+        if (tab === 'overview') renderOverview();
     });
 
     panel.on('change', '.amor__p-enabled', function () {
@@ -2305,6 +2306,80 @@ function setPlannerStatus(text) {
     $('#st-amor .amor__p-status').text(text || '');
 }
 
+const PLANNER_MODE_LABEL = { assisted: '辅助', autonomous: '自动导演', manual: '手动（只分析，不注入）' };
+function renderOverview() {
+    const box = $('#st-amor .amor__ov');
+    if (!box.length) return;
+    box.empty();
+    const cd = (currentChatKey() && settings.planner) ? (plannerChatData() || freshPlanChat()) : null;
+    if (!cd) { box.append($('<div class="amor__p-empty">').text('请先打开一个聊天。')); return; }
+    const s = cd.directorState;
+    const p = settings.planner;
+    const sc = s.scene;
+    const sec = (title) => { const d = $('<div class="amor__section">').append($('<div class="amor__label">').text(title)); box.append(d); return d; };
+    const item = (d, label, val) => { if (!val) return; if (label) d.append($('<div class="amor__ov-label">').text(label)); d.append($('<div class="amor__ov-val">').text(val)); };
+
+    const st = sec('运行状态');
+    const bits = [
+        '导演台：' + (settings.enabled ? '已开启' : '未开启'),
+        '剧情规划：' + (p.enabled ? PLANNER_MODE_LABEL[p.mode] || p.mode : '未开启'),
+        '已规划 ' + cd.revision.amorRevision + ' 轮',
+    ];
+    const lk = settings.style ? STYLE_PRESETS.find(x => x.id === settings.style) : null;
+    if (lk) bits.push('风格：' + lk.name);
+    st.append($('<div class="amor__ov-val">').text(bits.join(' · ')));
+
+    if (!s.currentBeat && !sc.objective && !sc.situation && !s.arc.stage) {
+        box.append($('<div class="amor__p-empty">').text(p.enabled ? '还没有规划。聊几轮后会自动出现，也可以到「剧情规划」页点「立即规划」。' : '剧情规划还没开启。到「剧情规划」页打开后，这里会显示当前剧情的全貌。'));
+        return;
+    }
+
+    const arc = sec('故事阶段');
+    if (s.arc.stage || s.arc.done.length) {
+        const chain = $('<div class="amor__p-chain">');
+        s.arc.done.forEach(x => chain.append($('<span class="amor__p-step is-done">').text(x)));
+        if (s.arc.stage) chain.append($('<span class="amor__p-step is-now">').text(s.arc.stage));
+        s.arc.next.forEach(x => chain.append($('<span class="amor__p-step is-next">').text(x)));
+        arc.append(chain);
+        item(arc, '', s.arc.summary);
+    } else arc.append($('<div class="amor__p-empty">').text('尚未归纳'));
+
+    const now = sec('当前场景');
+    item(now, '场景', sc.situation);
+    item(now, '地点', sc.location);
+    item(now, '在场人物', sc.participants);
+    item(now, '场景目标', sc.objective);
+    item(now, '当前冲突', sc.conflict);
+
+    const dir = sec('导演方向');
+    item(dir, '当前节拍', s.currentBeat);
+    item(dir, '节拍起因', s.beatCause);
+    item(dir, '情绪方向', s.emotionalDirection);
+    item(dir, '本轮避免', s.doNot.join('；'));
+    dir.append($('<div class="amor__ov-label">').text('张力'), $('<div class="amor__p-tension">').append(
+        $('<div class="amor__p-bar">').append($('<i>').css('width', s.tension + '%')),
+        $('<b class="amor__p-tension-val">').text(s.tension)));
+    if (s.doctorOrders.length) item(dir, '生效中的医嘱', s.doctorOrders.map(o => o.text).join('；'));
+
+    const hs = sec('故事健康');
+    const h = storyHealth(cd);
+    if (!h) hs.append($('<div class="amor__p-empty">').text('规划次数还太少，暂时不评估。'));
+    else {
+        const list = inspectStory(cd);
+        hs.append($('<div class="amor__p-hscore">').addClass('lv-' + h.level).append($('<b>').text(h.score), $('<span>').text(h.label), $('<em>').text(list.length ? '发现 ' + list.length + ' 项需留意' : '暂无需留意的问题')));
+        list.slice(0, 3).forEach(f => hs.append($('<div class="amor__p-find">').addClass('sev-' + f.sev).append($('<span class="amor__p-find-tag">').text(INSPECT_AREAS[f.area]), $('<span>').text(f.text))));
+    }
+
+    const pend = [];
+    const active = s.threads.filter(t => t.status === 'active').length;
+    if (active) pend.push('进行中的剧情线 ' + active + ' 条');
+    const due = s.consequences.filter(c => c.status === 'due').length;
+    if (due) pend.push('待落地的后果 ' + due + ' 条');
+    const ready = s.foreshadowPlan.filter(f => f.stage === 'ready').length;
+    if (ready) pend.push('时机成熟的伏笔 ' + ready + ' 条');
+    if (pend.length) item(sec('待办'), '', pend.join(' · '));
+}
+
 function renderStoryArc(cd) {
     const box = $('#st-amor .amor__p-arcchain').empty();
     const a = cd && cd.directorState.arc;
@@ -2332,6 +2407,7 @@ function renderPlanner() {
         .text(serendipityConnected() ? '已接入 Serendipity 剧情事实' : '未检测到 Serendipity（仅用最近对话）');
 
     const cd = currentChatKey() ? (plannerChatData() || freshPlanChat()) : null;
+    renderOverview();
     if (!cd) {
         renderStoryArc(null);
         renderThreads(null);
@@ -2405,10 +2481,14 @@ function buildPanel() {
         <button type="button" class="amor__close" title="关闭">×</button>
       </div>
       <div class="amor__tabs">
-        <button type="button" class="amor__tab on" data-tab="director">导演台</button>
+        <button type="button" class="amor__tab on" data-tab="overview">总览</button>
+        <button type="button" class="amor__tab" data-tab="director">导演台</button>
         <button type="button" class="amor__tab" data-tab="planner">剧情规划</button>
       </div>
-      <div class="amor__body" data-page="director">
+      <div class="amor__body" data-page="overview">
+        <div class="amor__ov"></div>
+      </div>
+      <div class="amor__body" data-page="director" style="display:none">
         <div class="amor__master">
           <label class="amor__switch"><input type="checkbox" class="amor__enabled"><span class="amor__switch-slider"></span></label>
           <span class="amor__master-label">导演模式</span>
