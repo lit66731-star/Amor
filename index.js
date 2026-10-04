@@ -16,7 +16,7 @@ import { selected_group } from '../../../group-chats.js';
 import { getStringHash } from '../../../utils.js';
 
 const extensionName = 'amor';
-const VERSION = '1.6.2';
+const VERSION = '1.6.3';
 
 // ---------------- 维度常量 ----------------
 const RHYTHMS = ['平缓', '日常', '暧昧', '紧张', '冲突', '高潮', '余波'];
@@ -295,6 +295,8 @@ const KNOW_STALE = 10;           // 信息差这么多次规划都没变化，�
 const FORE_TOO_MANY = 7;
 const INSPECT_AREAS = { pace: '推进', threads: '剧情线', foreshadow: '伏笔', emotion: '人物情绪', knowledge: '信息差', facts: '事实一致' };
 const INSPECT_SEV = { high: '严重', mid: '注意', low: '提示' };
+const HEALTH_PENALTY = { high: 35, mid: 20, low: 10 };
+const HEALTH_LEVELS = [{ min: 80, key: 'good', label: '良好' }, { min: 60, key: 'fair', label: '一般' }, { min: 0, key: 'poor', label: '需要关注' }];
 const MAX_ARC_HISTORY = 5;
 const ARC_RECENT = 3;           // 最近这么多次规划内发生的情绪变化，才会写进注入
 const THREAD_KINDS = { main: '主线', character: '人物线', world: '世界线' };
@@ -854,6 +856,21 @@ function inspectStory(cd, { withFacts = true } = {}) {
     const rank = { high: 0, mid: 1, low: 2 };
     return out.sort((a, b) => rank[a.sev] - rank[b.sev]);
 }
+// ---- 故事健康度（Story Health）：由巡检结果推算的参考分，不是对故事好坏的评价 ----
+function storyHealth(cd, findings) {
+    if (cd.revision.amorRevision < INSPECT_MIN_REV) return null;
+    const list = findings || inspectStory(cd);
+    const na = { foreshadow: !liveForeshadowMap(), facts: !serendipityConnected() };
+    const areas = Object.keys(INSPECT_AREAS).filter(k => !na[k]).map(k => {
+        const score = list.filter(f => f.area === k).reduce((v, f) => Math.max(0, v - HEALTH_PENALTY[f.sev]), 100);
+        return { key: k, label: INSPECT_AREAS[k], score };
+    });
+    const vals = areas.map(a => a.score);
+    const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
+    const score = Math.round(0.6 * mean + 0.4 * Math.min(...vals));
+    const level = HEALTH_LEVELS.find(l => score >= l.min);
+    return { score, level: level.key, label: level.label, areas };
+}
 function inspectionForPrompt(cd) {
     const list = inspectStory(cd).filter(f => f.sev !== 'low').slice(0, 4);
     return list.map(f => '- [' + INSPECT_AREAS[f.area] + '] ' + f.text).join('\n');
@@ -987,7 +1004,8 @@ function pushPlanSnapshot(cd, msgIndex) {
     const m = chat[msgIndex];
     if (!m) return;
     cd.snapshots = cd.snapshots.filter(sn => sn.msgIndex !== msgIndex);
-    cd.snapshots.push({ msgIndex, hash: msgHash(m), state: clone(cd.directorState) });
+    const h = storyHealth(cd);
+    cd.snapshots.push({ msgIndex, hash: msgHash(m), state: clone(cd.directorState), health: h ? h.score : null });
     if (cd.snapshots.length > MAX_SNAPSHOTS) cd.snapshots.splice(0, cd.snapshots.length - MAX_SNAPSHOTS);
 }
 
@@ -1164,6 +1182,7 @@ window.Amor.getStoryDirection = function (opts) {
         knowledgeState: clone(s.knowledge),
         foreshadowPlan: clone(s.foreshadowPlan),
         inspection: () => inspectStory(cd),
+        storyHealth: () => storyHealth(cd),
     };
     const include = opts && Array.isArray(opts.include) ? opts.include : null;
     const out = { revision: clone(cd.revision) };
@@ -1208,6 +1227,11 @@ function plannerPageHtml() {
             <span class="amor__link-status amor__p-link"></span>
             <span class="amor__p-status"></span>
           </div>
+        </div>
+
+        <div class="amor__section">
+          <div class="amor__label">故事健康度（由下方诊断推算的参考分，不是对故事好坏的评价）</div>
+          <div class="amor__p-health"></div>
         </div>
 
         <div class="amor__section">
@@ -1510,11 +1534,35 @@ function renderForeshadows(cd) {
     }
 }
 
+function renderHealth(cd, list) {
+    const box = $('#st-amor .amor__p-health').empty();
+    const h = cd ? storyHealth(cd, list) : null;
+    if (!h) { box.append($('<div class="amor__p-empty">').text(cd ? '规划次数还太少，暂时不评估。' : '请先打开一个聊天。')); return; }
+    const hist = cd.snapshots.map(sn => sn.health).filter(Number.isFinite);
+    let trend = '';
+    if (hist.length >= 2) {
+        const d = hist[hist.length - 1] - hist[hist.length - 2];
+        trend = d > 0 ? '较上次 ↑' + d : (d < 0 ? '较上次 ↓' + (-d) : '与上次持平');
+    }
+    box.append($('<div class="amor__p-hscore">').addClass('lv-' + h.level).append(
+        $('<b>').text(h.score), $('<span>').text(h.label), $('<em>').text(trend)));
+    if (hist.length >= 2) {
+        const spark = $('<div class="amor__p-spark">');
+        for (const v of hist.slice(-12)) spark.append($('<i>').css('height', Math.max(4, Math.round(v * 0.28)) + 'px').attr('title', v));
+        box.append(spark);
+    }
+    for (const a of h.areas) {
+        box.append($('<div class="amor__p-harea">').addClass(a.score < 60 ? 'lv-poor' : (a.score < 80 ? 'lv-fair' : 'lv-good')).append(
+            $('<span>').text(a.label), $('<div class="amor__p-bar">').append($('<i>').css('width', a.score + '%')), $('<b>').text(a.score)));
+    }
+}
+
 function renderInspection(cd) {
     const box = $('#st-amor .amor__p-inspect').empty();
-    if (!cd) { box.append($('<div class="amor__p-empty">').text('请先打开一个聊天。')); return; }
-    if (cd.revision.amorRevision < INSPECT_MIN_REV) { box.append($('<div class="amor__p-empty">').text('规划次数还太少，暂时不做诊断。')); return; }
+    if (!cd) { renderHealth(null); box.append($('<div class="amor__p-empty">').text('请先打开一个聊天。')); return; }
+    if (cd.revision.amorRevision < INSPECT_MIN_REV) { renderHealth(cd); box.append($('<div class="amor__p-empty">').text('规划次数还太少，暂时不做诊断。')); return; }
     const list = inspectStory(cd);
+    renderHealth(cd, list);
     if (!list.length) { box.append($('<div class="amor__p-empty">').text('目前没有发现需要留意的问题。')); return; }
     for (const f of list) {
         box.append($('<div class="amor__p-find">').addClass('sev-' + f.sev).append(

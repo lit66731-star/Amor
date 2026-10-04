@@ -388,6 +388,23 @@
 #st-amor .amor__p-find.sev-mid { border-left-color: var(--amor-accent); background: var(--amor-accent-soft); }
 #st-amor .amor__p-find-tag { display: inline-block; margin-right: 8px; font-size: 12px; color: var(--amor-text-soft); }
 
+/* 故事健康度 */
+#st-amor .amor__p-hscore { display: flex; align-items: baseline; gap: 10px; margin-bottom: 10px; }
+#st-amor .amor__p-hscore b { font-size: 34px; font-family: Georgia, "Songti SC", serif; font-weight: 600; }
+#st-amor .amor__p-hscore span { font-size: 14px; }
+#st-amor .amor__p-hscore em { font-style: normal; font-size: 12px; color: var(--amor-text-soft); }
+#st-amor .amor__p-hscore.lv-good b, #st-amor .amor__p-hscore.lv-good span { color: #5f8a6a; }
+#st-amor .amor__p-hscore.lv-fair b, #st-amor .amor__p-hscore.lv-fair span { color: var(--amor-accent); }
+#st-amor .amor__p-hscore.lv-poor b, #st-amor .amor__p-hscore.lv-poor span { color: #c96a5a; }
+#st-amor .amor__p-spark { display: flex; align-items: flex-end; gap: 3px; height: 30px; margin-bottom: 12px; }
+#st-amor .amor__p-spark i { flex: 0 0 8px; background: #e2d8ce; border-radius: 2px; }
+#st-amor .amor__p-spark i:last-child { background: var(--amor-accent); }
+#st-amor .amor__p-harea { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; font-size: 13px; }
+#st-amor .amor__p-harea span { flex: 0 0 76px; }
+#st-amor .amor__p-harea b { width: 28px; text-align: right; font-weight: 400; color: var(--amor-text-soft); }
+#st-amor .amor__p-harea.lv-poor .amor__p-bar i { background: #c96a5a; }
+#st-amor .amor__p-harea.lv-good .amor__p-bar i { background: #8fb39a; }
+
 /* 移动端 */
 @media (max-width: 480px) {
     #st-amor .amor__body { padding: 16px 14px 40px; }
