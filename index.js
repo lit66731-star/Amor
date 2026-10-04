@@ -15,7 +15,7 @@ import { selected_group } from '../../../group-chats.js';
 import { getStringHash } from '../../../utils.js';
 
 const extensionName = 'amor';
-const VERSION = '1.3.0';
+const VERSION = '1.3.1';
 
 // ---------------- 维度常量 ----------------
 const RHYTHMS = ['平缓', '日常', '暧昧', '紧张', '冲突', '高潮', '余波'];
@@ -93,6 +93,14 @@ function loadSettings() {
     if (!Number.isFinite(p.everyN) || p.everyN < 1) p.everyN = pdef.everyN;
     if (!Number.isFinite(p.tokenBudget) || p.tokenBudget < 500) p.tokenBudget = pdef.tokenBudget;
     if (!p.chats || typeof p.chats !== 'object' || Array.isArray(p.chats)) p.chats = {};
+    // 1.3.0 会给打开过的每个聊天建空档，这里清掉从未产生过内容的空条目
+    const emptyState = JSON.stringify(freshPlanState());
+    for (const k of Object.keys(p.chats)) {
+        const c = p.chats[k];
+        const ds = c && c.directorState ? JSON.stringify(Object.assign(freshPlanState(), c.directorState, { scene: Object.assign(freshPlanState().scene, c.directorState.scene || {}) })) : emptyState;
+        const noRev = !c || !c.revision || !c.revision.amorRevision;
+        if (!c || (noRev && !(c.snapshots && c.snapshots.length) && !(c.outcomes && c.outcomes.length) && ds === emptyState)) delete p.chats[k];
+    }
     s.planner = p;
     settings = s;
 }
@@ -254,9 +262,10 @@ function syncAutoRefreshTimer() {
 
 // ---------------- 剧情规划（场景 / 目标 / 冲突 / 节拍，评估实际结果后重规划） ----------------
 // 与上面的「导演台旋钮」互不干扰：旋钮管「怎么写」（节奏/镜头/重点），规划管「写什么」（这一幕要发生什么变化）。
-const PLAN_DELAY_MS = 1500;      // 生成结束后等一会再规划，让 Serendipity 先把这一轮记完
+const PLAN_DELAY_MS = 1500;      // 生成结束后稍等再规划，避开与自动导演同一时刻发请求
 const PLAN_TIMEOUT_MS = 120000;
-const MAX_SNAPSHOTS = 60;        // 每轮规划留一份快照，用于删除/重生成/Swipe 时回滚
+const PLAN_INJECT_DEPTH = 1;     // 0 = 最末尾，1 = 倒数第二条之前
+const MAX_SNAPSHOTS = 20;        // 每轮规划留一份快照，用于删除/重生成/Swipe 时回滚（存在酒馆设置里，别留太多）
 const MAX_OUTCOMES = 30;
 const TRANSCRIPT_MESSAGES = 6;   // 喂给规划的最近消息条数
 const TRANSCRIPT_CHARS = 1200;   // 单条消息截断长度
@@ -339,8 +348,16 @@ function currentChatKey() {
     return (ck && cid) ? (ck + '::' + cid) : '';
 }
 
-// 取不到聊天标识时返回 null，调用方一律按「不工作」处理，不往库里写脏条目
+// 只读：取不到聊天标识或该聊天还没有规划数据时返回 null，不往设置里写任何东西
 function plannerChatData() {
+    const key = currentChatKey();
+    if (!key || !settings || !settings.planner) return null;
+    const cd = settings.planner.chats[key];
+    return cd ? normalizePlanChat(cd) : null;
+}
+
+// 只在真正要写入规划（开启后规划 / 手动改字段）时才建档
+function plannerEnsureChat() {
     const key = currentChatKey();
     if (!key || !settings || !settings.planner) return null;
     const chats = settings.planner.chats;
@@ -576,10 +593,10 @@ function pushPlanSnapshot(cd, msgIndex) {
 async function runPlanner({ manual = false } = {}) {
     if (!settings.planner.enabled) { if (manual) toastr.warning('请先开启「剧情规划」'); return; }
     if (plannerBusy) return;
-    const cd = plannerChatData();
-    if (!cd) { if (manual) toastr.warning('请先打开一个聊天'); return; }
+    if (!currentChatKey()) { if (manual) toastr.warning('请先打开一个聊天'); return; }
     const lastIdx = lastRealIndex();
     if (lastIdx < 0) { if (manual) toastr.warning('当前聊天还没有剧情可供规划'); return; }
+    const cd = plannerEnsureChat();
     const hash0 = msgHash(chat[lastIdx]);
     plannerBusy = true;
     setPlannerStatus('规划中…');
@@ -609,11 +626,11 @@ async function runPlanner({ manual = false } = {}) {
 // 生成结束后：有新消息才算一轮，按频率触发规划
 function onPlannerGenerationEnded() {
     if (!settings.planner.enabled || settings.planner.mode !== 'assisted') return;
-    const cd = plannerChatData();
-    if (!cd) return;
+    if (!currentChatKey()) return;
     plannerReconcile();
     const idx = lastRealIndex();
     if (idx < 0) return;
+    const cd = plannerEnsureChat();
     const m = chat[idx];
     if (m.is_user) return;
     const seen = idx + ':' + msgHash(m);
@@ -677,14 +694,15 @@ function updatePlannerInjection() {
     } catch (e) {
         console.warn('[Amor] 构建规划注入失败：', e);
     }
-    setExtensionPrompt('amor_story', text, extension_prompt_types.IN_PROMPT, 0);
+    // 放在聊天记录靠近末尾处（深度 1），比放进系统提示词区域更能影响下一条回复
+    setExtensionPrompt('amor_story', text, extension_prompt_types.IN_CHAT, PLAN_INJECT_DEPTH);
 }
 
 // ---- 对外接口 ----
 window.Amor = window.Amor || {};
 window.Amor.getStoryDirection = function (opts) {
-    const cd = plannerChatData();
-    if (!cd) return null;
+    if (!currentChatKey()) return null;
+    const cd = plannerChatData() || freshPlanChat();
     const s = cd.directorState;
     const all = {
         currentScene: clone(s.scene),
@@ -799,14 +817,14 @@ function bindPlannerEvents() {
         if (!confirm('重置后，本聊天的规划状态和结果记录会清空（Serendipity 的数据不受影响）。继续吗？')) return;
         const key = currentChatKey();
         if (!key) return;
-        settings.planner.chats[key] = freshPlanChat();
+        delete settings.planner.chats[key];
         saveSettings();
         updatePlannerInjection();
         renderPlanner();
     });
     // 手动改字段：写入当前状态，并同步到最新快照，避免之后回滚时把手改的内容冲掉
     panel.on('change', '.amor__p-input', function () {
-        const cd = plannerChatData();
+        const cd = plannerEnsureChat();
         if (!cd) return;
         const path = $(this).data('path');
         const f = PLAN_FIELDS.find(x => x.path === path);
@@ -851,7 +869,7 @@ function renderPlanner() {
     panel.find('.amor__p-link')
         .text(serendipityConnected() ? '已接入 Serendipity 剧情事实' : '未检测到 Serendipity（仅用最近对话）');
 
-    const cd = plannerChatData();
+    const cd = currentChatKey() ? (plannerChatData() || freshPlanChat()) : null;
     if (!cd) {
         panel.find('.amor__p-input').val('').prop('disabled', true);
         panel.find('.amor__p-outcomes').empty();
