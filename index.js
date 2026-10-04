@@ -17,7 +17,7 @@ import { selected_group } from '../../../group-chats.js';
 import { getStringHash } from '../../../utils.js';
 
 const extensionName = 'amor';
-const VERSION = '1.9.1';
+const VERSION = '1.10.0';
 
 // ---------------- 维度常量 ----------------
 const RHYTHMS = ['平缓', '日常', '暧昧', '紧张', '冲突', '高潮', '余波'];
@@ -35,6 +35,28 @@ const INITIATIVE_ROLES = [
 ];
 const INIT_LEVELS = ['低', '中', '高'];
 
+// 内置导演风格：只改变怎么写（节奏 / 镜头 / 叙事重点 / 主动性 / 推进速度 / 风格基调），不改变任何事实与设定
+const STYLE_PRESETS = [
+    { id: 'balanced', name: '均衡', rhythm: '日常', camera: '中景', focus: { psy: 5, env: 4, dialog: 5, action: 5 }, initiative: { user: '中', ai: '中', npc: '中' }, pacing: 5,
+      hint: '' },
+    { id: 'slowburn', name: '慢热', rhythm: '平缓', camera: '近景', focus: { psy: 8, env: 6, dialog: 5, action: 2 }, initiative: { user: '中', ai: '低', npc: '低' }, pacing: 2,
+      hint: '以细节和情绪的积累为主，不急于推进到结果，让每一个小变化都有分量。' },
+    { id: 'cinematic', name: '电影感', rhythm: '日常', camera: '中景', focus: { psy: 4, env: 8, dialog: 5, action: 7 }, initiative: { user: '中', ai: '中', npc: '中' }, pacing: 6,
+      hint: '像电影一样调度画面：注意光线、空间、人物的位置与动作节奏，画面之间有取舍，不要事无巨细。' },
+    { id: 'tension', name: '高张力', rhythm: '紧张', camera: '人物特写', focus: { psy: 7, env: 4, dialog: 6, action: 7 }, initiative: { user: '中', ai: '高', npc: '高' }, pacing: 7,
+      hint: '保持压迫感与悬而未决，信息一点点收紧，不要过早释放张力。' },
+    { id: 'romance', name: '恋爱', rhythm: '暧昧', camera: '近景', focus: { psy: 9, env: 5, dialog: 7, action: 3 }, initiative: { user: '中', ai: '中', npc: '低' }, pacing: 3,
+      hint: '重视情绪与关系的细微变化，用眼神、距离、语气和停顿表现心意，不替玩家角色表态。' },
+    { id: 'mystery', name: '悬疑', rhythm: '紧张', camera: '环境描写', focus: { psy: 6, env: 8, dialog: 5, action: 4 }, initiative: { user: '中', ai: '中', npc: '中' }, pacing: 4,
+      hint: '以线索和信息差推动，细节要有意义，不要提前揭晓答案，让疑点自然累积。' },
+    { id: 'political', name: '权谋', rhythm: '日常', camera: '中景', focus: { psy: 8, env: 4, dialog: 9, action: 2 }, initiative: { user: '中', ai: '高', npc: '高' }, pacing: 4,
+      hint: '重视各方的立场、利益与言外之意，台词里藏着试探和筹码，每个人物都从自己的立场出发行动。' },
+    { id: 'dark', name: '沉郁', rhythm: '平缓', camera: '环境描写', focus: { psy: 8, env: 8, dialog: 4, action: 3 }, initiative: { user: '中', ai: '中', npc: '中' }, pacing: 4,
+      hint: '基调压抑沉重，不回避人物的痛苦与代价，但不渲染不必要的残忍细节。' },
+    { id: 'adventure', name: '冒险', rhythm: '紧张', camera: '动作描写', focus: { psy: 3, env: 7, dialog: 4, action: 9 }, initiative: { user: '中', ai: '中', npc: '高' }, pacing: 8,
+      hint: '推进明确，有行动和发现，场景不断变化，每一步都带来新的目标或阻碍。' },
+];
+
 // ---------------- 状态 ----------------
 function freshSettings() {
     return {
@@ -45,6 +67,7 @@ function freshSettings() {
         initiative: { user: '中', ai: '中', npc: '中' },   // 低/中/高
         pacing: 5,             // 0-10，0=慢 10=快
         custom: '',            // 自定义导演指令
+        style: '',             // 内置风格 id（STYLE_PRESETS），空 = 无
         autoDirector: false,   // 自动导演模式（每轮生成后 AI 分析并调整旋钮）
         autoNote: '',          // AI 自动生成的导演指令
         lastAnalysisAt: 0,     // 上次自动分析时间戳
@@ -81,6 +104,7 @@ function loadSettings() {
     if (typeof s.rhythm !== 'string') s.rhythm = '';
     if (typeof s.camera !== 'string') s.camera = '';
     if (typeof s.custom !== 'string') s.custom = '';
+    if (typeof s.style !== 'string' || !STYLE_PRESETS.some(x => x.id === s.style)) s.style = '';
     if (s.pacing == null) s.pacing = def.pacing;
     if (typeof s.autoDirector !== 'boolean') s.autoDirector = !!s.autoDirector;
     if (typeof s.autoNote !== 'string') s.autoNote = '';
@@ -140,6 +164,8 @@ function buildDirectorPrompt() {
     const ini = settings.initiative || {};
     lines.push('· 角色主动性：用户角色 ' + (ini.user || '中') + '、AI 角色 ' + (ini.ai || '中') + '、NPC ' + (ini.npc || '中') + '。');
     lines.push('· 剧情推进速度：' + pacingDesc(settings.pacing != null ? settings.pacing : 5));
+    const st = STYLE_PRESETS.find(x => x.id === settings.style);
+    if (st && st.hint) lines.push('· 风格基调（' + st.name + '，只影响怎么写，不改变任何事实与设定）：' + st.hint);
     if (settings.custom && settings.custom.trim()) lines.push('· 自定义导演指令：' + settings.custom.trim());
     return lines.join('\n');
 }
@@ -2341,6 +2367,12 @@ function buildPanel() {
         </div>
 
         <div class="amor__section">
+          <div class="amor__label">导演风格（一键套用节奏 / 镜头 / 重点 / 主动性 / 速度，之后仍可逐项微调；只影响怎么写，不改变事实）</div>
+          <div class="amor__seg amor__styles"></div>
+          <div class="amor__pacing-hint amor__style-hint"></div>
+        </div>
+
+        <div class="amor__section">
           <div class="amor__label">剧情节奏</div>
           <div class="amor__seg amor__rhythm"></div>
         </div>
@@ -2410,6 +2442,13 @@ function renderPanel() {
     const hasSD = typeof window.Serendipity === 'object' && typeof window.Serendipity.getDirectorContext === 'function';
     panel.find('.amor__link-status').text(hasSD ? '已接入 Serendipity 剧情上下文' : '未检测到 Serendipity（仅用最近对话）');
 
+    // 导演风格
+    const sw = panel.find('.amor__styles').empty();
+    sw.append(`<button type="button" class="amor__seg-btn${settings.style ? '' : ' on'}" data-id="">无</button>`);
+    STYLE_PRESETS.forEach(x => sw.append(`<button type="button" class="amor__seg-btn${settings.style === x.id ? ' on' : ''}" data-id="${x.id}">${x.name}</button>`));
+    const cur = STYLE_PRESETS.find(x => x.id === settings.style);
+    panel.find('.amor__style-hint').text(cur ? (cur.hint || '均衡：不偏向任何一种风格。') : '');
+
     // 剧情节奏
     const r = panel.find('.amor__rhythm').empty();
     RHYTHMS.forEach(v => r.append(`<button type="button" class="amor__seg-btn${settings.rhythm === v ? ' on' : ''}" data-v="${v}">${v}</button>`));
@@ -2466,6 +2505,7 @@ function snapshotDirector() {
         initiative: Object.assign({}, settings.initiative),
         pacing: settings.pacing,
         custom: settings.custom,
+        style: settings.style,
     };
 }
 
@@ -2575,6 +2615,21 @@ function bindPanelEvents() {
         panel.find('.amor__preset-name').val('');
         renderPresets();
         toastr.success('已保存预设「' + name + '」');
+    });
+    panel.on('click', '.amor__styles .amor__seg-btn', function () {
+        const id = String($(this).data('id') || '');
+        const st = STYLE_PRESETS.find(x => x.id === id);
+        if (st) {
+            settings.rhythm = st.rhythm;
+            settings.camera = st.camera;
+            settings.focus = Object.assign({}, st.focus);
+            settings.initiative = Object.assign({}, st.initiative);
+            settings.pacing = st.pacing;
+        }
+        settings.style = st ? st.id : '';
+        saveSettings();
+        renderPanel();
+        updatePromptInjection();
     });
     panel.on('click', '.amor__preset-load', function () {
         const p = settings.presets.find(x => x.id === $(this).data('id'));
