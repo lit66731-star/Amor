@@ -16,7 +16,7 @@ import { selected_group } from '../../../group-chats.js';
 import { getStringHash } from '../../../utils.js';
 
 const extensionName = 'amor';
-const VERSION = '1.7.0';
+const VERSION = '1.7.1';
 
 // ---------------- 维度常量 ----------------
 const RHYTHMS = ['平缓', '日常', '暧昧', '紧张', '冲突', '高潮', '余波'];
@@ -304,6 +304,12 @@ const CONS_DONE_KEEP = 3;        // 已兑现 / 已取消的后果，保留这�
 const CONS_DUE_WARN = 3;         // 「该兑现」的后果这么多次规划都没落地，提醒
 const CONS_PENDING_STALE = 12;   // 已埋下的后果这么多次规划既没兑现也没取消，提醒
 const CONS_TOO_MANY = 6;
+const DOCTOR_KIND = { event: '外部事件', secret: '推进秘密', npc: 'NPC 行动', scene: '转移场景', thread: '推进剧情线', consequence: '兑现后果', other: '其他' };
+const DOCTOR_CAUSE = { goal: '角色目标缺失', conflict: '冲突不足', objective: '场景目标已完成', topic: '话题耗尽', pacing: '节奏失衡', causal: '因果断裂', info: '信息差无处发力', other: '其他' };
+const DOCTOR_RX_STATUS = { open: '待处理', postponed: '稍后处理', ignored: '已忽略', adopted: '已采纳' };
+const MAX_PRESCRIPTIONS = 4;
+const MAX_DOCTOR_ORDERS = 2;
+const DOCTOR_ORDER_TTL = 3;      // 采纳的医嘱有效的规划次数
 const ARC_RECENT = 3;           // 最近这么多次规划内发生的情绪变化，才会写进注入
 const THREAD_KINDS = { main: '主线', character: '人物线', world: '世界线' };
 const THREAD_STATUS = { active: '进行中', paused: '暂停', resolved: '已完结' };
@@ -348,6 +354,7 @@ function freshPlanState() {
         foreshadowPlan: [],
         consequences: [],
         beatCause: '',
+        doctorOrders: [],
         stagnantRounds: 0,
         lastDecision: '',
     };
@@ -360,6 +367,7 @@ function freshPlanChat() {
         lastSeenKey: '',
         roundsSincePlan: 0,
         directorState: freshPlanState(),
+        doctor: null,
         snapshots: [],
         outcomes: [],
         meta: { createdAt: Date.now(), updatedAt: Date.now() },
@@ -379,6 +387,8 @@ function normalizePlanChat(cd) {
     if (!Array.isArray(cd.directorState.foreshadowPlan)) cd.directorState.foreshadowPlan = [];
     if (!Array.isArray(cd.directorState.consequences)) cd.directorState.consequences = [];
     if (typeof cd.directorState.beatCause !== 'string') cd.directorState.beatCause = '';
+    if (!Array.isArray(cd.directorState.doctorOrders)) cd.directorState.doctorOrders = [];
+    if (!cd.doctor || typeof cd.doctor !== 'object' || !Array.isArray(cd.doctor.rx)) cd.doctor = null;
     if (!Array.isArray(cd.snapshots)) cd.snapshots = [];
     if (!Array.isArray(cd.outcomes)) cd.outcomes = [];
     if (typeof cd.lastSeenKey !== 'string') cd.lastSeenKey = '';
@@ -957,6 +967,7 @@ const PLANNER_SYSTEM = `你是一名角色扮演故事的「剧情规划师」�
 11. 伏笔（foreshadows）本身由 Serendipity 记录，你只规划「何时、怎样」铺垫与回收：只能处理【伏笔】列表里已有的 id，不能新增伏笔，也不能宣布某条伏笔已回收。stage 取值：sleep 暂时不碰；hint 偶尔在细节里轻轻带过；build 可以进一步铺垫；ready 时机成熟，可以创造让它浮出水面的契机。每个节拍最多自然带出一条伏笔，不要直接说破真相，也不要一次抖出多条。回收需要玩家角色做选择或行动时，只能创造契机，不能替玩家完成。nextHint 写「在场景里怎样自然带出」，revealWhen 写「什么条件下可以回收」，都要具体。hinted 表示上一轮实际剧情是否带出了这条伏笔。
 12. 「巡检发现的问题」是规则检测出的参考，不一定都是真问题。确实存在的，在下一个节拍里用剧情内的方式自然化解，不要为此破坏已有设定、不要替玩家角色做决定；判断不是问题的可以忽略。
 13. 因果链：剧情推进靠「事件引发后果」。nextBeat 应该有来由——beatCause 用一句话写出它是由哪件已经发生的事（人物的行动、被发现的线索、做出的选择）引发的，不能写「剧情需要」，找不到来由就改成别的节拍。consequences 记录已经埋下、但还没落地的后果：起因必须是剧情里实际发生的事，后果是它在世界里自然会引发的变化（他人的反应、事态发展、关系的变化、环境的改变）；status：pending 已埋下但时机未到，due 时机已到、应该开始落地，realized 上一轮实际剧情里已经发生，dismissed 因情况变化不再成立。上一轮实际发生了的标 realized；已有条目沿用原 id；每一两轮最多让一条后果落地，不要把后果一次全部兑现，也不要无限拖延。玩家角色的行动可以成为起因，但后果只能落在世界与其他人物身上，不能是替玩家角色做出的决定。
+14. 「已采纳的医嘱」是用户确认过的修正方向：nextBeat 应当以剧情内自然的方式体现它（有多条时体现最合适的一条），但仍要遵守以上所有规则，尤其是不替玩家角色做决定。
 
 只输出一个 JSON 对象，不要任何解释，不要代码块。格式：
 {
@@ -1017,6 +1028,7 @@ function buildPlanPrompt(cd, lastIdx) {
         threadsForPrompt(cd, s) ? '【当前剧情线（你上一轮维护的）】\n' + threadsForPrompt(cd, s) : '',
         arcsForPrompt(s) ? '【人物情绪弧线（你上一轮维护的）】\n' + arcsForPrompt(s) : '',
         knowledgeForPrompt(s) ? '【信息分布：谁知道什么（你上一轮维护的）】\n' + knowledgeForPrompt(s) : '',
+        doctorOrdersForPrompt(cd, s) ? '【已采纳的医嘱（用户确认过的修正方向）】\n' + doctorOrdersForPrompt(cd, s) : '',
         consequencesForPrompt(cd, s) ? '【已埋下的后果（因果链，你上一轮维护的）】\n' + consequencesForPrompt(cd, s) : '',
         foreshadowsForPrompt(cd, s) ? '【伏笔（事实来自 Serendipity，安排是你上一轮维护的）】\n' + foreshadowsForPrompt(cd, s) : '',
         inspectionForPrompt(cd) ? '【巡检发现的问题（规则检测，供参考）】\n' + inspectionForPrompt(cd) : '',
@@ -1059,6 +1071,7 @@ function applyPlan(cd, plan, msgIndex) {
     s.lastDecision = cleanStr(plan.reason, 200);
     cd.revision.amorRevision += 1;
     cd.revision.lastProcessedMessageIndex = msgIndex;
+    s.doctorOrders = s.doctorOrders.filter(o => o.expiresAt > cd.revision.amorRevision);
     mergeThreads(cd, s, plan.threads);
     mergeEmotionalArcs(cd, s, plan.emotionalArcs);
     mergeKnowledge(cd, s, plan.knowledge);
@@ -1078,6 +1091,102 @@ function pushPlanSnapshot(cd, msgIndex) {
     const h = storyHealth(cd);
     cd.snapshots.push({ msgIndex, hash: msgHash(m), state: clone(cd.directorState), health: h ? h.score : null });
     if (cd.snapshots.length > MAX_SNAPSHOTS) cd.snapshots.splice(0, cd.snapshots.length - MAX_SNAPSHOTS);
+}
+
+// ---- 故事医生（Story Doctor）：手动触发的深度诊断。找停滞 / 失衡的根因，给出可选的处方；采纳后成为有时限的医嘱 ----
+const DOCTOR_SYSTEM = `你是一名角色扮演故事的「故事医生」。你不写正文，只在用户请求时，诊断这个故事现在为什么不顺，并给出几个可供选择的修正方向。
+
+工作规则：
+1. 已知事实（来自 Serendipity）和聊天里实际发生的内容是依据；你的诊断是推断，处方是建议。不得改写已知事实，不得凭空发明与设定冲突的内容。
+2. 先找根因，而不是复述症状。根因类型：goal 角色缺少目标或动机；conflict 冲突不足；objective 这一幕的目标已经完成；topic 当前话题已经耗尽；pacing 节奏失衡（过平或过紧）；causal 事件之间缺少因果、显得突兀；info 信息差没有发挥作用；other 其他。可以有一到三个根因，按影响从大到小排列，每个用一句话说明依据。
+3. 如果故事状态其实良好，如实写在 diagnosis 里，causes 和 prescriptions 都留空数组，不要硬凑问题。
+4. 处方要具体、可在场景里自然发生，每条方向互不相同，最多 4 条。kind：event 引入一个外部事件；secret 让某个人物的秘密露出一角；npc 让某个 NPC 主动做一件事；scene 转移或切换场景；thread 推进某条未完成的剧情线；consequence 让一条已埋下的后果开始落地；other 其他。优先使用故事里已有的东西（未完成的剧情线、已埋下的后果、伏笔、信息差），而不是另起炉灶。
+5. 尊重玩家角色的自主权：处方只能制造压力、提供机会、改变环境、让其他人物行动，不能替玩家角色做重大决定（杀人、告白、背叛、接受任务、离开等），也不能规定玩家角色的内心活动。
+6. 处方是供用户选择的方向，不是命令，用词不要强制。
+
+只输出一个 JSON 对象，不要任何解释，不要代码块。格式：
+{
+  "diagnosis": "一两句话概括：故事现在的主要问题和根因",
+  "causes": [ { "type": "goal / conflict / objective / topic / pacing / causal / info / other", "text": "依据，一句话" } ],
+  "prescriptions": [ { "kind": "event / secret / npc / scene / thread / consequence / other", "title": "八个字以内的标题", "detail": "怎样在场景里自然发生，一两句话" } ]
+}`;
+
+function doctorValid(cd) {
+    const d = cd && cd.doctor;
+    if (!d) return false;
+    const m = chat[d.msgIndex];
+    return !!m && msgHash(m) === d.hash;
+}
+function doctorOrdersForPrompt(cd, s) {
+    if (!s.doctorOrders.length) return '';
+    return s.doctorOrders.map(o => '- ' + DOCTOR_KIND[o.kind] + '：' + o.text).join('\n');
+}
+function buildDoctorPrompt(cd, lastIdx) {
+    const facts = getPlannerFacts();
+    const s = cd.directorState;
+    const findings = inspectStory(cd).map(f => '- [' + INSPECT_AREAS[f.area] + '] ' + f.text).join('\n');
+    const recent = cd.outcomes.slice(-6).map(o => '- ' + o.text + (o.beatCompleted === false ? '（规划的节拍没有真正发生）' : '')).join('\n');
+    const hasState = !!(s.currentBeat || s.scene.objective || s.scene.situation);
+    return [
+        '【已知事实（来自 Serendipity）】\n' + (facts || '（没有可用的 Serendipity 事实，请只依据最近剧情）'),
+        '【当前规划状态】\n' + (hasState ? planStateForPrompt(s) : '（尚无规划状态）') + (s.beatCause ? '\n节拍起因：' + s.beatCause : '') + (s.stagnantRounds ? '\n已连续 ' + s.stagnantRounds + ' 轮被判定为空转' : ''),
+        threadsForPrompt(cd, s) ? '【剧情线】\n' + threadsForPrompt(cd, s) : '',
+        arcsForPrompt(s) ? '【人物情绪】\n' + arcsForPrompt(s) : '',
+        knowledgeForPrompt(s) ? '【信息分布】\n' + knowledgeForPrompt(s) : '',
+        consequencesForPrompt(cd, s) ? '【已埋下的后果】\n' + consequencesForPrompt(cd, s) : '',
+        foreshadowsForPrompt(cd, s) ? '【伏笔】\n' + foreshadowsForPrompt(cd, s) : '',
+        findings ? '【巡检发现的问题（规则检测）】\n' + findings : '',
+        recent ? '【最近几轮的实际结果】\n' + recent : '',
+        '【最近剧情】\n' + buildPlanTranscript(lastIdx),
+        '请按规则输出 JSON。',
+    ].filter(Boolean).join('\n\n');
+}
+function applyDoctorReport(cd, raw, lastIdx) {
+    const causes = (Array.isArray(raw.causes) ? raw.causes : []).slice(0, 3).map(c => ({
+        type: pickKey(c && c.type, DOCTOR_CAUSE, 'other'), text: cleanStr(c && c.text, 100),
+    })).filter(c => c.text);
+    const rx = [];
+    for (const p of (Array.isArray(raw.prescriptions) ? raw.prescriptions : []).slice(0, MAX_PRESCRIPTIONS)) {
+        if (!p || typeof p !== 'object') continue;
+        const title = cleanStr(p.title, 16), detail = cleanStr(p.detail, 160);
+        if (!title || !detail) continue;
+        rx.push({ id: newThreadId(rx), kind: pickKey(p.kind, DOCTOR_KIND, 'other'), title, detail, status: 'open' });
+    }
+    cd.doctor = {
+        msgIndex: lastIdx, hash: msgHash(chat[lastIdx]), rev: cd.revision.amorRevision, at: Date.now(),
+        diagnosis: cleanStr(raw.diagnosis, 200) || '（医生没有给出诊断）', causes, rx,
+    };
+}
+let doctorBusy = false;
+async function runDoctor() {
+    if (!settings.planner.enabled) { toastr.warning('请先开启「剧情规划」'); return; }
+    if (doctorBusy) return;
+    if (!currentChatKey()) { toastr.warning('请先打开一个聊天'); return; }
+    const lastIdx = lastRealIndex();
+    if (lastIdx < 0) { toastr.warning('当前聊天还没有剧情可供会诊'); return; }
+    const cd = plannerEnsureChat();
+    syncForeshadowPlan(cd);
+    const hash0 = msgHash(chat[lastIdx]);
+    doctorBusy = true;
+    $('#st-amor .amor__p-doc-run').prop('disabled', true);
+    setPlannerStatus('故事医生会诊中…');
+    try {
+        const raw = await runExclusive(() => callPlannerLLM({ systemPrompt: DOCTOR_SYSTEM, prompt: buildDoctorPrompt(cd, lastIdx) }));
+        const m = chat[lastIdx];
+        if (!m || msgHash(m) !== hash0 || plannerChatData() !== cd) { setPlannerStatus(''); return; }
+        applyDoctorReport(cd, parsePlanJson(raw), lastIdx);
+        saveSettings();
+        renderDoctor(cd);
+        setPlannerStatus('');
+    } catch (e) {
+        const detail = safeErrorText(e, settings.planner.api.key);
+        console.warn('[Amor] 故事医生会诊失败：', e);
+        setPlannerStatus('会诊失败：' + detail);
+        toastr.error('故事医生会诊失败：' + detail);
+    } finally {
+        doctorBusy = false;
+        $('#st-amor .amor__p-doc-run').prop('disabled', false);
+    }
 }
 
 async function runPlanner({ manual = false } = {}) {
@@ -1178,6 +1287,10 @@ function buildPlanBlock(s, cd) {
     const bt = findThread(s.threads, s.beatThread);
     if (s.currentBeat) lines.push('本轮应推进的节拍：' + s.currentBeat + (bt ? '（对应剧情线：' + bt.title + '）' : ''));
     if (s.beatCause) lines.push('这个节拍的来由：' + s.beatCause);
+    if (s.doctorOrders.length) {
+        lines.push('医嘱（用户已采纳的修正方向，请在本轮自然体现其中之一）：' + s.doctorOrders.map(o => o.text).join('；'));
+        lines.push('医嘱是方向，不是剧本：用环境、事件或其他人物的行动来实现，不要替 {{user}} 做决定。');
+    }
     const dueC = s.consequences.filter(c => c.status === 'due').slice(0, 2);
     if (dueC.length) {
         lines.push('已经埋下、现在该落地的后果：' + dueC.map(c => '因为' + c.cause + '，' + c.effect).join('；'));
@@ -1258,6 +1371,8 @@ window.Amor.getStoryDirection = function (opts) {
         emotionalArcs: clone(s.emotionalArcs),
         knowledgeState: clone(s.knowledge),
         foreshadowPlan: clone(s.foreshadowPlan),
+        doctorOrders: clone(s.doctorOrders),
+        doctorReport: (cd.doctor && doctorValid(cd)) ? clone(cd.doctor) : null,
         causalChains: { beatCause: s.beatCause, consequences: clone(s.consequences) },
         inspection: () => inspectStory(cd),
         storyHealth: () => storyHealth(cd),
@@ -1315,6 +1430,12 @@ function plannerPageHtml() {
         <div class="amor__section">
           <div class="amor__label">故事诊断（规则检测，不调用模型，只提示不改动）</div>
           <div class="amor__p-inspect"></div>
+        </div>
+
+        <div class="amor__section">
+          <div class="amor__label">故事医生（手动会诊：找出剧情不顺的根因，给出可选的修正方向。会调用一次模型）</div>
+          <div class="amor__auto-ctl-row"><button type="button" class="amor__direct-now amor__p-doc-run">请医生会诊</button></div>
+          <div class="amor__p-doc"></div>
         </div>
 
         <div class="amor__section">
@@ -1438,6 +1559,7 @@ function bindPlannerEvents() {
             last.state.knowledge = clone(cd.directorState.knowledge);
             last.state.foreshadowPlan = clone(cd.directorState.foreshadowPlan);
             last.state.consequences = clone(cd.directorState.consequences);
+            last.state.doctorOrders = clone(cd.directorState.doctorOrders);
         }
         cd.meta.updatedAt = Date.now();
         saveSettings();
@@ -1524,6 +1646,34 @@ function bindPlannerEvents() {
         for (const key of ['knownBy', 'suspectedBy', 'unknownBy']) card.find(`[data-f="${key}"]`).val(k[key].join('、'));
         if (f === 'subject') $(this).val(k.subject);
         if (f === 'fact') $(this).val(k.fact);
+    });
+    panel.on('click', '.amor__p-doc-run', () => runDoctor());
+    panel.on('click', '.amor__p-rx-act', function () {
+        const cd = plannerChatData();
+        if (!cd || !cd.doctor) return;
+        if (!doctorValid(cd)) { cd.doctor = null; saveSettings(); renderDoctor(cd); return; }
+        const rx = cd.doctor.rx.find(x => x.id === $(this).closest('.amor__p-rx').attr('data-id'));
+        if (!rx) return;
+        const act = $(this).data('act');
+        if (act === 'adopt') {
+            const orders = cd.directorState.doctorOrders;
+            orders.push({ id: newThreadId(orders), kind: rx.kind, title: rx.title, text: rx.title + '：' + rx.detail, expiresAt: cd.revision.amorRevision + DOCTOR_ORDER_TTL });
+            while (orders.length > MAX_DOCTOR_ORDERS) orders.shift();
+            rx.status = 'adopted';
+            syncExtrasToSnapshot(cd);
+        } else {
+            rx.status = act === 'ignore' ? 'ignored' : 'postponed';
+            saveSettings();
+        }
+        renderDoctor(cd);
+    });
+    panel.on('click', '.amor__p-order-del', function () {
+        const cd = plannerChatData();
+        if (!cd) return;
+        const id = $(this).closest('.amor__p-order').attr('data-id');
+        cd.directorState.doctorOrders = cd.directorState.doctorOrders.filter(o => o.id !== id);
+        syncExtrasToSnapshot(cd);
+        renderDoctor(cd);
     });
     panel.on('click', '.amor__p-ca-add', () => {
         const cd = plannerEnsureChat();
@@ -1619,6 +1769,53 @@ function renderKnowledge(cd) {
             $('<button type="button" class="amor__p-th-del amor__p-ka-del" title="删除">×</button>')));
         row.append($('<input type="text" class="amor__p-ka amor__p-ea-dir" data-f="fact" maxlength="120" placeholder="信息内容（一句话）" spellcheck="false">').val(k.fact));
         row.append(lab('知情', list('knownBy', k.knownBy)), lab('怀疑', list('suspectedBy', k.suspectedBy)), lab('不知情', list('unknownBy', k.unknownBy)));
+        box.append(row);
+    }
+}
+
+function renderDoctor(cd) {
+    const box = $('#st-amor .amor__p-doc').empty();
+    if (!cd) { box.append($('<div class="amor__p-empty">').text('请先打开一个聊天。')); return; }
+    const orders = cd.directorState.doctorOrders;
+    if (orders.length) {
+        box.append($('<div class="amor__p-field-label amor__p-sub">').text('生效中的医嘱（会注入下一轮，到期自动失效）'));
+        for (const o of orders) {
+            const left = Math.max(0, o.expiresAt - cd.revision.amorRevision);
+            box.append($('<div class="amor__p-thread amor__p-order">').attr('data-id', o.id).append(
+                $('<div class="amor__p-th-row">').append(
+                    $('<span class="amor__p-find-tag">').text(DOCTOR_KIND[o.kind] || '其他'),
+                    $('<div class="amor__p-fa-title">').text(o.text),
+                    $('<button type="button" class="amor__p-th-del amor__p-order-del" title="撤销">×</button>')),
+                $('<div class="amor__p-th-meta">').text('还剩约 ' + left + ' 次规划')));
+        }
+    }
+    if (cd.doctor && !doctorValid(cd)) { cd.doctor = null; saveSettings(); }
+    const d = cd.doctor;
+    if (!d) {
+        if (!orders.length) box.append($('<div class="amor__p-empty">').text('还没有会诊记录。觉得剧情空转、重复或没有方向时，点上面的按钮。'));
+        return;
+    }
+    box.append($('<div class="amor__p-doc-diag">').text(d.diagnosis));
+    for (const c of d.causes) {
+        box.append($('<div class="amor__p-find sev-mid">').append(
+            $('<span class="amor__p-find-tag">').text(DOCTOR_CAUSE[c.type]), $('<span>').text(c.text)));
+    }
+    if (!d.rx.length) { box.append($('<div class="amor__p-empty">').text('医生认为目前不需要处方。')); return; }
+    box.append($('<div class="amor__p-field-label amor__p-sub">').text('处方（可采纳、忽略或稍后处理）'));
+    for (const x of d.rx) {
+        const row = $('<div class="amor__p-thread amor__p-rx">').attr('data-id', x.id).toggleClass('is-done', x.status === 'ignored' || x.status === 'adopted');
+        row.append($('<div class="amor__p-th-row">').append(
+            $('<span class="amor__p-find-tag">').text(DOCTOR_KIND[x.kind]), $('<b class="amor__p-fa-title">').text(x.title)));
+        row.append($('<div class="amor__p-rx-detail">').text(x.detail));
+        if (x.status === 'open' || x.status === 'postponed') {
+            row.append($('<div class="amor__p-rx-btns">').append(
+                $('<button type="button" class="amor__p-reset amor__p-rx-act" data-act="adopt">采纳</button>'),
+                $('<button type="button" class="amor__p-reset amor__p-rx-act" data-act="postpone">稍后</button>'),
+                $('<button type="button" class="amor__p-reset amor__p-rx-act" data-act="ignore">忽略</button>'),
+                x.status === 'postponed' ? $('<span class="amor__p-th-unit">已标记为稍后处理</span>') : ''));
+        } else {
+            row.append($('<div class="amor__p-th-meta">').text(DOCTOR_RX_STATUS[x.status]));
+        }
         box.append(row);
     }
 }
@@ -1779,6 +1976,7 @@ function renderPlanner() {
         renderKnowledge(null);
         renderForeshadows(null);
         renderConsequences(null);
+        renderDoctor(null);
         renderInspection(null);
         panel.find('.amor__p-input').val('').prop('disabled', true);
         panel.find('.amor__p-outcomes').empty();
@@ -1791,6 +1989,7 @@ function renderPlanner() {
     renderKnowledge(cd);
     renderForeshadows(cd);
     renderConsequences(cd);
+    renderDoctor(cd);
     renderInspection(cd);
     panel.find('.amor__p-input').prop('disabled', false).each(function () {
         const v = getPath(s, $(this).data('path'));

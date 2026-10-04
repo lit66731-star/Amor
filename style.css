@@ -408,6 +408,14 @@
 #st-amor .amor__p-harea.lv-poor .amor__p-bar i { background: #c96a5a; }
 #st-amor .amor__p-harea.lv-good .amor__p-bar i { background: #8fb39a; }
 
+/* 故事医生 */
+#st-amor .amor__p-doc-diag { margin: 12px 0 10px; font-size: 14px; line-height: 1.6; }
+#st-amor .amor__p-doc-run:disabled { opacity: 0.5; cursor: default; }
+#st-amor .amor__p-rx-detail { margin-top: 6px; font-size: 13px; line-height: 1.6; }
+#st-amor .amor__p-rx-btns { display: flex; align-items: center; gap: 8px; margin-top: 10px; }
+#st-amor .amor__p-rx.is-done { opacity: 0.55; }
+#st-amor .amor__p-rx .amor__p-th-row, #st-amor .amor__p-order .amor__p-th-row { flex-wrap: nowrap; }
+
 /* 移动端 */
 @media (max-width: 480px) {
     #st-amor .amor__body { padding: 16px 14px 40px; }
