@@ -15,7 +15,7 @@ import { selected_group } from '../../../group-chats.js';
 import { getStringHash } from '../../../utils.js';
 
 const extensionName = 'amor';
-const VERSION = '1.3.3';
+const VERSION = '1.3.4';
 
 // ---------------- 维度常量 ----------------
 const RHYTHMS = ['平缓', '日常', '暧昧', '紧张', '冲突', '高潮', '余波'];
@@ -278,6 +278,7 @@ const PLAN_INJECT_DEPTH = 1;     // 0 = 最末尾，1 = 倒数第二条之前
 const MAX_SNAPSHOTS = 20;        // 每轮规划留一份快照，用于删除/重生成/Swipe 时回滚（存在酒馆设置里，别留太多）
 const MAX_OUTCOMES = 30;
 const TRANSCRIPT_MESSAGES = 6;   // 喂给规划的最近消息条数
+const MIN_NEW_CHARS = 150;       // 距上次规划新增的正文少于这个字数、且事实没变化时，跳过规划
 const TRANSCRIPT_CHARS = 1200;   // 单条消息截断长度
 
 const PLAN_FIELDS = [
@@ -315,7 +316,7 @@ function freshPlanState() {
 function freshPlanChat() {
     return {
         schemaVersion: 1,
-        revision: { amorRevision: 0, lastProcessedMessageIndex: -1 },
+        revision: { amorRevision: 0, lastProcessedMessageIndex: -1, serendipityRevision: '' },
         lastSeenKey: '',
         roundsSincePlan: 0,
         directorState: freshPlanState(),
@@ -408,6 +409,27 @@ function buildPlanTranscript(lastIdx) {
 function serendipityConnected() {
     return typeof window.Serendipity === 'object' && typeof window.Serendipity.getDirectorContext === 'function';
 }
+// Serendipity 的事实指纹：事实有变化它就变；取不到返回空串
+function getSerendipityRevision() {
+    if (!serendipityConnected()) return '';
+    try {
+        const r = window.Serendipity.getDirectorContext({ purpose: 'amor', tokenBudget: 200, include: ['storyTime'] });
+        return (r && typeof r === 'object' && r.revision != null) ? String(r.revision) : '';
+    } catch (e) { return ''; }
+}
+
+// 第 0 层规则判断（不调用模型）：没有实质新内容、事实也没变，就不值得再规划一次
+function plannerWorthRunning(cd, idx) {
+    if (!cd.revision.amorRevision) return true;
+    const rev = getSerendipityRevision();
+    if (rev && rev !== cd.revision.serendipityRevision) return true;
+    let chars = 0;
+    for (let i = cd.revision.lastProcessedMessageIndex + 1; i <= idx; i++) {
+        if (isRealMessage(chat[i])) chars += cleanText(chat[i].mes).length;
+    }
+    return chars >= MIN_NEW_CHARS;
+}
+
 function getPlannerFacts() {
     if (!serendipityConnected()) return '';
     try {
@@ -608,6 +630,7 @@ async function runPlanner({ manual = false } = {}) {
     if (lastIdx < 0) { if (manual) toastr.warning('当前聊天还没有剧情可供规划'); return; }
     const cd = plannerEnsureChat();
     const hash0 = msgHash(chat[lastIdx]);
+    const rev0 = getSerendipityRevision();
     plannerBusy = true;
     setPlannerStatus('规划中…');
     try {
@@ -617,6 +640,7 @@ async function runPlanner({ manual = false } = {}) {
         const m = chat[lastIdx];
         if (!m || msgHash(m) !== hash0 || plannerChatData() !== cd) { setPlannerStatus(''); return; }
         applyPlan(cd, parsePlanJson(raw), lastIdx);
+        cd.revision.serendipityRevision = rev0;
         pushPlanSnapshot(cd, lastIdx);
         saveSettings();
         updatePlannerInjection();
@@ -649,6 +673,11 @@ function onPlannerGenerationEnded() {
     cd.lastSeenKey = seen;
     cd.roundsSincePlan += 1;
     if (cd.roundsSincePlan < (settings.planner.everyN || 1)) { saveSettings(); return; }
+    if (!plannerWorthRunning(cd, idx)) {
+        saveSettings();
+        setPlannerStatus('新增内容很少且事实无变化，已跳过本轮规划');
+        return;
+    }
     clearTimeout(planTimer);
     planTimer = setTimeout(() => runPlanner(), PLAN_DELAY_MS);
 }
@@ -1243,3 +1272,10 @@ jQuery(async () => {
         onPlannerGenerationEnded();
     });
 });
+
+// ST 自动更新扩展后会调用 manifest.hooks.update 指向的这个函数（此时新代码已 git pull 到磁盘），
+// 在这里刷新页面以加载新版本，无需手动刷新。
+export function reloadOnUpdate() {
+    toastr.info('Amor 已更新，正在刷新页面以应用新版本...', undefined, { timeOut: 1500 });
+    setTimeout(() => location.reload(), 1500);
+}
