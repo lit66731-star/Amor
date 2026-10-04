@@ -16,7 +16,7 @@ import { selected_group } from '../../../group-chats.js';
 import { getStringHash } from '../../../utils.js';
 
 const extensionName = 'amor';
-const VERSION = '1.8.0';
+const VERSION = '1.9.0';
 
 // ---------------- 维度常量 ----------------
 const RHYTHMS = ['平缓', '日常', '暧昧', '紧张', '冲突', '高潮', '余波'];
@@ -56,7 +56,7 @@ function freshSettings() {
 function freshPlanner() {
     return {
         enabled: false,
-        mode: 'assisted',      // assisted 自动规划并注入 | manual 只分析不注入
+        mode: 'assisted',      // assisted 自动规划并注入 | autonomous 无人值守的自动导演 | manual 只分析不注入
         everyN: 1,             // 每几轮规划一次
         urgentReplan: true,    // 巡检发现严重问题 / 节拍屡次落空时，不等 everyN 提前重规划
         tokenBudget: 2500,     // 向 Serendipity 索取事实的预算
@@ -91,7 +91,7 @@ function loadSettings() {
     const p = (s.planner && typeof s.planner === 'object' && !Array.isArray(s.planner)) ? s.planner : {};
     p.api = Object.assign({}, pdef.api, (p.api && typeof p.api === 'object') ? p.api : {});
     if (typeof p.enabled !== 'boolean') p.enabled = false;
-    if (p.mode !== 'manual') p.mode = 'assisted';
+    if (p.mode !== 'manual' && p.mode !== 'autonomous') p.mode = 'assisted';
     if (!Number.isFinite(p.everyN) || p.everyN < 1) p.everyN = pdef.everyN;
     if (typeof p.urgentReplan !== 'boolean') p.urgentReplan = pdef.urgentReplan;
     if (!Number.isFinite(p.tokenBudget) || p.tokenBudget < 500) p.tokenBudget = pdef.tokenBudget;
@@ -289,6 +289,7 @@ const FORE_STAGE = { sleep: '潜伏', hint: '暗示', build: '铺垫', ready: '�
 const MAX_FORE = 8;
 const FORE_IDLE_WARN = 6;        // 已安排暗示/铺垫的伏笔，这么多次规划都没被带出，视为久未提及
 const INSPECT_MIN_REV = 2;       // 规划次数少于这个值时数据太少，不做诊断
+const AUTO_DOCTOR_COOLDOWN = 4;  // 自动导演：自动会诊之后，至少隔这么多次规划才能再次自动会诊
 const URGENT_COOLDOWN = 2;       // 提前重规划之后，至少隔这么多次规划才能再次提前触发
 const BEAT_MISS_WARN = 2;        // 节拍连续这么多轮没有真正发生，提醒换切入点
 const TENSION_FLAT_ROUNDS = 4;   // 看最近这么多次规划的张力走势
@@ -373,6 +374,7 @@ function freshPlanChat() {
         lastSeenKey: '',
         roundsSincePlan: 0,
         lastUrgentRev: -99,
+        lastAutoDoctorRev: -99,
         directorState: freshPlanState(),
         doctor: null,
         choices: null,
@@ -403,6 +405,7 @@ function normalizePlanChat(cd) {
     if (typeof cd.lastSeenKey !== 'string') cd.lastSeenKey = '';
     if (typeof cd.roundsSincePlan !== 'number') cd.roundsSincePlan = 0;
     if (typeof cd.lastUrgentRev !== 'number') cd.lastUrgentRev = -99;
+    if (typeof cd.lastAutoDoctorRev !== 'number') cd.lastAutoDoctorRev = -99;
     cd.meta = Object.assign(f.meta, cd.meta || {});
     return cd;
 }
@@ -873,7 +876,9 @@ function beatMissCount(cd) {
 }
 // 需要提前重规划的理由（纯规则，没有就返回空字符串）：巡检里有严重问题，或节拍连续落空
 function urgentReason(cd) {
-    if (!settings.planner.urgentReplan) return '';
+    return settings.planner.urgentReplan ? severeProblem(cd) : '';
+}
+function severeProblem(cd) {
     if (cd.revision.amorRevision < INSPECT_MIN_REV) return '';
     const high = inspectStory(cd, { withFacts: false }).filter(f => f.sev === 'high');
     if (high.length) return high[0].text;
@@ -1058,6 +1063,7 @@ function buildPlanPrompt(cd, lastIdx, urgent) {
         inspectionForPrompt(cd) ? '【巡检发现的问题（规则检测，供参考）】\n' + inspectionForPrompt(cd) : '',
         recent ? '【最近几轮的实际结果记录】\n' + recent : '',
         '【最近剧情】\n' + buildPlanTranscript(lastIdx),
+        settings.planner.mode === 'autonomous' ? '【运行模式：自动导演】这段剧情可能无人逐轮把关，所以不要让场景原地等待：每一轮都要有一个实质的变化，用事件、环境和其他人物的主动行动来推动。但玩家角色的重大决定（杀人、告白、背叛、接受任务、离开等）仍然不能替玩家做，只制造压力和机会，把选择留给玩家。' : '',
         urgent ? '【本次规划需要重点处理】问题：' + urgent + '。请直接针对这个问题调整本轮规划：换一个更容易自然发生的切入点，不要重复上一个节拍的写法；仍然不要替玩家角色做决定。' : '',
         '请按规则输出 JSON。',
     ].filter(Boolean).join('\n\n');
@@ -1265,13 +1271,20 @@ function applyDoctorReport(cd, raw, lastIdx) {
         diagnosis: cleanStr(raw.diagnosis, 200) || '（医生没有给出诊断）', causes, rx,
     };
 }
+function adoptPrescription(cd, rx) {
+    const orders = cd.directorState.doctorOrders;
+    orders.push({ id: newThreadId(orders), kind: rx.kind, title: rx.title, text: rx.title + '：' + rx.detail, expiresAt: cd.revision.amorRevision + DOCTOR_ORDER_TTL });
+    while (orders.length > MAX_DOCTOR_ORDERS) orders.shift();
+    rx.status = 'adopted';
+}
 let doctorBusy = false;
-async function runDoctor() {
-    if (!settings.planner.enabled) { toastr.warning('请先开启「剧情规划」'); return; }
-    if (doctorBusy) return;
-    if (!currentChatKey()) { toastr.warning('请先打开一个聊天'); return; }
+async function runDoctor({ auto = false } = {}) {
+    const warn = (t) => { if (!auto) toastr.warning(t); };
+    if (!settings.planner.enabled) { warn('请先开启「剧情规划」'); return false; }
+    if (doctorBusy) return false;
+    if (!currentChatKey()) { warn('请先打开一个聊天'); return false; }
     const lastIdx = lastRealIndex();
-    if (lastIdx < 0) { toastr.warning('当前聊天还没有剧情可供会诊'); return; }
+    if (lastIdx < 0) { warn('当前聊天还没有剧情可供会诊'); return false; }
     const cd = plannerEnsureChat();
     syncForeshadowPlan(cd);
     const hash0 = msgHash(chat[lastIdx]);
@@ -1281,19 +1294,45 @@ async function runDoctor() {
     try {
         const raw = await runExclusive(() => callPlannerLLM({ systemPrompt: DOCTOR_SYSTEM, prompt: buildDoctorPrompt(cd, lastIdx) }));
         const m = chat[lastIdx];
-        if (!m || msgHash(m) !== hash0 || plannerChatData() !== cd) { setPlannerStatus(''); return; }
+        if (!m || msgHash(m) !== hash0 || plannerChatData() !== cd) { setPlannerStatus(''); return false; }
         applyDoctorReport(cd, parsePlanJson(raw), lastIdx);
+        if (auto) {
+            // 自动导演：只自动采纳排在第一位的处方，且仅在当前没有生效医嘱时；随时可在面板里撤销
+            const rx = cd.doctor.rx.find(x => x.status === 'open');
+            if (rx && cd.directorState.doctorOrders.length === 0) {
+                adoptPrescription(cd, rx);
+                syncExtrasToSnapshot(cd);
+                updatePlannerInjection();
+            }
+        }
         saveSettings();
         renderDoctor(cd);
-        setPlannerStatus('');
+        setPlannerStatus(auto ? '自动导演：已会诊并采纳医嘱（可在「故事医生」里撤销）' : '');
+        return true;
     } catch (e) {
         const detail = safeErrorText(e, settings.planner.api.key);
         console.warn('[Amor] 故事医生会诊失败：', e);
         setPlannerStatus('会诊失败：' + detail);
-        toastr.error('故事医生会诊失败：' + detail);
+        if (!auto) toastr.error('故事医生会诊失败：' + detail);
+        return false;
     } finally {
         doctorBusy = false;
         $('#st-amor .amor__p-doc-run').prop('disabled', false);
+    }
+}
+
+// 自动导演：规划之后若仍有严重问题、当前又没有生效的医嘱，自动请医生会诊一次（带冷却）
+async function maybeAutoDoctor(cd) {
+    try {
+        if (settings.planner.mode !== 'autonomous' || plannerChatData() !== cd) return;
+        const rev = cd.revision.amorRevision;
+        if (cd.lastAutoDoctorRev <= rev && rev - cd.lastAutoDoctorRev < AUTO_DOCTOR_COOLDOWN) return;
+        if (cd.directorState.doctorOrders.length) return;
+        if (!severeProblem(cd)) return;
+        cd.lastAutoDoctorRev = rev;
+        await runDoctor({ auto: true });
+    } catch (e) {
+        console.warn('[Amor] 自动会诊失败：', e);
     }
 }
 
@@ -1323,6 +1362,7 @@ async function runPlanner({ manual = false, urgent = '' } = {}) {
         renderPlanner();
         setPlannerStatus('');
         if (manual) toastr.success('Amor 已重新规划');
+        if (settings.planner.mode === 'autonomous') setTimeout(() => maybeAutoDoctor(cd), 0);
     } catch (e) {
         // 规划失败不影响正文生成：沿用上一份规划状态
         const detail = safeErrorText(e, settings.planner.api.key);
@@ -1336,7 +1376,7 @@ async function runPlanner({ manual = false, urgent = '' } = {}) {
 
 // 生成结束后：有新消息才算一轮，按频率触发规划
 function onPlannerGenerationEnded() {
-    if (!settings.planner.enabled || settings.planner.mode !== 'assisted') return;
+    if (!settings.planner.enabled || settings.planner.mode === 'manual') return;
     if (!currentChatKey()) return;
     plannerReconcile();
     const idx = lastRealIndex();
@@ -1348,7 +1388,7 @@ function onPlannerGenerationEnded() {
     if (seen === cd.lastSeenKey) return;
     cd.lastSeenKey = seen;
     cd.roundsSincePlan += 1;
-    const due = cd.roundsSincePlan >= (settings.planner.everyN || 1);
+    const due = settings.planner.mode === 'autonomous' || cd.roundsSincePlan >= (settings.planner.everyN || 1);
     const rev = cd.revision.amorRevision;
     const reason = urgentReason(cd);
     const early = !due && !!reason && (cd.lastUrgentRev > rev || rev - cd.lastUrgentRev >= URGENT_COOLDOWN);
@@ -1461,7 +1501,7 @@ function updatePlannerInjection() {
     let text = '';
     try {
         const cd = plannerChatData();
-        if (settings.planner.enabled && settings.planner.mode === 'assisted' && cd) text = buildPlanBlock(cd.directorState, cd);
+        if (settings.planner.enabled && settings.planner.mode !== 'manual' && cd) text = buildPlanBlock(cd.directorState, cd);
     } catch (e) {
         console.warn('[Amor] 构建规划注入失败：', e);
     }
@@ -1522,6 +1562,7 @@ function plannerPageHtml() {
           <span class="amor__master-sep"></span>
           <select class="amor__p-mode">
             <option value="assisted">辅助：自动规划并注入</option>
+            <option value="autonomous">自动导演：无人值守，每轮规划并自动会诊</option>
             <option value="manual">手动：只分析，不注入</option>
           </select>
         </div>
@@ -1644,7 +1685,8 @@ function bindPlannerEvents() {
         updatePlannerInjection();
     });
     panel.on('change', '.amor__p-mode', function () {
-        settings.planner.mode = $(this).val() === 'manual' ? 'manual' : 'assisted';
+        const mv = $(this).val();
+        settings.planner.mode = (mv === 'manual' || mv === 'autonomous') ? mv : 'assisted';
         saveSettings();
         updatePlannerInjection();
     });
@@ -1797,10 +1839,7 @@ function bindPlannerEvents() {
         if (!rx) return;
         const act = $(this).data('act');
         if (act === 'adopt') {
-            const orders = cd.directorState.doctorOrders;
-            orders.push({ id: newThreadId(orders), kind: rx.kind, title: rx.title, text: rx.title + '：' + rx.detail, expiresAt: cd.revision.amorRevision + DOCTOR_ORDER_TTL });
-            while (orders.length > MAX_DOCTOR_ORDERS) orders.shift();
-            rx.status = 'adopted';
+            adoptPrescription(cd, rx);
             syncExtrasToSnapshot(cd);
         } else {
             rx.status = act === 'ignore' ? 'ignored' : 'postponed';
