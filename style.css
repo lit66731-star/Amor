@@ -348,7 +348,8 @@
 #st-amor .amor__p-th,
 #st-amor .amor__p-ea,
 #st-amor .amor__p-ka,
-#st-amor .amor__p-fa {
+#st-amor .amor__p-fa,
+#st-amor .amor__p-ca {
     box-sizing: border-box; padding: 6px 8px; font-size: 13px; font-family: inherit;
     color: var(--amor-text); background: var(--amor-surface);
     border: 1px solid var(--amor-border); border-radius: 6px;
@@ -356,7 +357,8 @@
 #st-amor .amor__p-th:focus,
 #st-amor .amor__p-ea:focus,
 #st-amor .amor__p-ka:focus,
-#st-amor .amor__p-fa:focus { outline: none; border-color: var(--amor-accent); }
+#st-amor .amor__p-fa:focus,
+#st-amor .amor__p-ca:focus { outline: none; border-color: var(--amor-accent); }
 #st-amor .amor__p-th-title { width: 100%; margin-bottom: 8px; }
 #st-amor .amor__p-th-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 #st-amor .amor__p-th-pct { width: 58px; }
@@ -372,7 +374,8 @@
 #st-amor .amor__p-ea-add,
 #st-amor .amor__p-ka-add { margin-top: 4px; }
 #st-amor .amor__p-ea-top .amor__p-ea,
-#st-amor .amor__p-ea-top input.amor__p-ka { flex: 1; min-width: 0; }
+#st-amor .amor__p-ea-top input.amor__p-ka,
+#st-amor .amor__p-ea-top input.amor__p-ca { flex: 1; min-width: 0; }
 #st-amor .amor__p-ka-l { display: flex; align-items: center; gap: 8px; margin-top: 8px; font-size: 12px; color: var(--amor-text-soft); }
 #st-amor .amor__p-ka-l span { flex: 0 0 44px; }
 #st-amor .amor__p-ka-l input { flex: 1; min-width: 0; }

@@ -16,7 +16,7 @@ import { selected_group } from '../../../group-chats.js';
 import { getStringHash } from '../../../utils.js';
 
 const extensionName = 'amor';
-const VERSION = '1.6.3';
+const VERSION = '1.7.0';
 
 // ---------------- 维度常量 ----------------
 const RHYTHMS = ['平缓', '日常', '暧昧', '紧张', '冲突', '高潮', '余波'];
@@ -293,11 +293,17 @@ const TENSION_FLAT_RANGE = 5;
 const TENSION_HIGH = 85;
 const KNOW_STALE = 10;           // 信息差这么多次规划都没变化，视为停滞
 const FORE_TOO_MANY = 7;
-const INSPECT_AREAS = { pace: '推进', threads: '剧情线', foreshadow: '伏笔', emotion: '人物情绪', knowledge: '信息差', facts: '事实一致' };
+const INSPECT_AREAS = { pace: '推进', threads: '剧情线', foreshadow: '伏笔', emotion: '人物情绪', knowledge: '信息差', causality: '因果', facts: '事实一致' };
 const INSPECT_SEV = { high: '严重', mid: '注意', low: '提示' };
 const HEALTH_PENALTY = { high: 35, mid: 20, low: 10 };
 const HEALTH_LEVELS = [{ min: 80, key: 'good', label: '良好' }, { min: 60, key: 'fair', label: '一般' }, { min: 0, key: 'poor', label: '需要关注' }];
 const MAX_ARC_HISTORY = 5;
+const CONS_STATUS = { pending: '已埋下', due: '该兑现', realized: '已兑现', dismissed: '已取消' };
+const MAX_CONS = 8;
+const CONS_DONE_KEEP = 3;        // 已兑现 / 已取消的后果，保留这么多次规划后清掉
+const CONS_DUE_WARN = 3;         // 「该兑现」的后果这么多次规划都没落地，提醒
+const CONS_PENDING_STALE = 12;   // 已埋下的后果这么多次规划既没兑现也没取消，提醒
+const CONS_TOO_MANY = 6;
 const ARC_RECENT = 3;           // 最近这么多次规划内发生的情绪变化，才会写进注入
 const THREAD_KINDS = { main: '主线', character: '人物线', world: '世界线' };
 const THREAD_STATUS = { active: '进行中', paused: '暂停', resolved: '已完结' };
@@ -314,6 +320,7 @@ const PLAN_FIELDS = [
     { path: 'scene.objective', label: '场景目标', rows: 2 },
     { path: 'scene.conflict', label: '当前冲突', rows: 2 },
     { path: 'currentBeat', label: '当前节拍', rows: 2 },
+    { path: 'beatCause', label: '节拍起因（为什么接下来会发生这个）', rows: 2 },
     { path: 'emotionalDirection', label: '情绪方向', rows: 1 },
     { path: 'doNot', label: '本轮避免（每行一条）', rows: 3, list: true },
 ];
@@ -339,6 +346,8 @@ function freshPlanState() {
         emotionalArcs: [],
         knowledge: [],
         foreshadowPlan: [],
+        consequences: [],
+        beatCause: '',
         stagnantRounds: 0,
         lastDecision: '',
     };
@@ -368,6 +377,8 @@ function normalizePlanChat(cd) {
     if (!Array.isArray(cd.directorState.emotionalArcs)) cd.directorState.emotionalArcs = [];
     if (!Array.isArray(cd.directorState.knowledge)) cd.directorState.knowledge = [];
     if (!Array.isArray(cd.directorState.foreshadowPlan)) cd.directorState.foreshadowPlan = [];
+    if (!Array.isArray(cd.directorState.consequences)) cd.directorState.consequences = [];
+    if (typeof cd.directorState.beatCause !== 'string') cd.directorState.beatCause = '';
     if (!Array.isArray(cd.snapshots)) cd.snapshots = [];
     if (!Array.isArray(cd.outcomes)) cd.outcomes = [];
     if (typeof cd.lastSeenKey !== 'string') cd.lastSeenKey = '';
@@ -724,6 +735,50 @@ function knowledgeForPrompt(s) {
     return s.knowledge.map(k => `- id=${k.id} | ${k.subject}` + (k.fact ? '：' + k.fact : '') + ' | ' + (knowledgeLine(k) || '（尚无记录）') + ' | ' + KNOW_CONFIDENCE[k.confidence]).join('\n');
 }
 
+// ---- 因果链（Causal Engine）：事件引发后果；记录「已经埋下、还没兑现」的后果，到了时机让它自然落地 ----
+const consTerminal = (c) => c.status === 'realized' || c.status === 'dismissed';
+function consIdle(cd, c) { return Math.max(0, cd.revision.amorRevision - (Number.isFinite(c.lastChangedAt) ? c.lastChangedAt : 0)); }
+function trimConsequences(cd, s) {
+    s.consequences = s.consequences.filter(c => !(consTerminal(c) && consIdle(cd, c) >= CONS_DONE_KEEP));
+    while (s.consequences.length > MAX_CONS) {
+        let worst = -1;
+        for (let i = 0; i < s.consequences.length; i++) {
+            const c = s.consequences[i];
+            const better = worst < 0 || (consTerminal(c) && !consTerminal(s.consequences[worst])) ||
+                (consTerminal(c) === consTerminal(s.consequences[worst]) && c.lastChangedAt < s.consequences[worst].lastChangedAt);
+            if (better) worst = i;
+        }
+        s.consequences.splice(worst, 1);
+    }
+}
+function mergeConsequences(cd, s, list) {
+    if (!Array.isArray(list)) { trimConsequences(cd, s); return; }
+    const rev = cd.revision.amorRevision;
+    for (const raw of list.slice(0, MAX_CONS + 2)) {
+        if (!raw || typeof raw !== 'object') continue;
+        const cause = cleanStr(raw.cause, 80), effect = cleanStr(raw.effect, 100);
+        let c = findThread(s.consequences, raw.id) || (cause ? s.consequences.find(x => x.cause === cause) : null);
+        if (!c) {
+            if (!cause || !effect || raw.status === 'realized' || raw.status === 'dismissed') continue;
+            // 新后果只能从「已埋下」或「该兑现」开始
+            c = { id: newThreadId(s.consequences), cause, effect, status: raw.status === 'due' ? 'due' : 'pending', lastChangedAt: rev };
+            s.consequences.push(c);
+            continue;
+        }
+        // 已经发生或已取消的不再被改回去（实际结果 > 计划）；想重新启用请手动修改
+        if (consTerminal(c)) continue;
+        if (effect) c.effect = effect;
+        const st = pickKey(raw.status, CONS_STATUS, c.status);
+        if (st !== c.status) { c.status = st; c.lastChangedAt = rev; }
+    }
+    trimConsequences(cd, s);
+}
+function consequencesForPrompt(cd, s) {
+    const rows = s.consequences.filter(c => !consTerminal(c));
+    if (!rows.length) return '';
+    return rows.map(c => `- id=${c.id} | 起因：${c.cause} | 后果：${c.effect} | ${CONS_STATUS[c.status]} | ${consIdle(cd, c)}次规划前更新`).join('\n');
+}
+
 // ---- 伏笔导演（Foreshadow Director）：伏笔本身归 Serendipity，这里只规划「何时、怎样」铺垫与回收 ----
 function getSerendipityForeshadows() {
     if (typeof window.Serendipity !== 'object' || typeof window.Serendipity.getForeshadows !== 'function') return null;
@@ -834,6 +889,15 @@ function inspectStory(cd, { withFacts = true } = {}) {
         if (fp.length && fp.every(p => p.stage === 'sleep') && Math.max(...fp.map(p => foreIdle(cd, p))) >= KNOW_STALE) add('foreshadow', 'low', '所有伏笔都处于潜伏，已经很久没有任何暗示');
     }
 
+    // 因果
+    const consOpen = s.consequences.filter(c => !consTerminal(c));
+    const dueLate = consOpen.filter(c => c.status === 'due' && consIdle(cd, c) >= CONS_DUE_WARN);
+    if (dueLate.length) add('causality', 'mid', '「' + dueLate[0].cause + '」引发的后果' + (dueLate.length > 1 ? '等 ' + dueLate.length + ' 条' : '') + '早已成熟，却迟迟没有落地，容易让前面的行动显得没有分量');
+    const oldPending = consOpen.filter(c => c.status === 'pending' && consIdle(cd, c) >= CONS_PENDING_STALE);
+    if (oldPending.length) add('causality', 'low', names(oldPending.map(c => c.cause)) + '埋下的后果很久没有变化，可以让它浮现，或者确认不再成立后取消');
+    if (consOpen.length >= CONS_TOO_MANY) add('causality', 'low', '同时悬着 ' + consOpen.length + ' 条未兑现的后果，过多会让因果线索散乱');
+    if (rev >= 4 && s.currentBeat && !s.beatCause) add('causality', 'low', '当前节拍没有说明起因，可能是凭空出现的事件，要留意是否突兀');
+
     // 人物情绪
     const noCause = [], volatile = [];
     for (const a of s.emotionalArcs) {
@@ -892,6 +956,7 @@ const PLANNER_SYSTEM = `你是一名角色扮演故事的「剧情规划师」�
 10. 知识状态（knowledge）记录「谁知道什么」：世界上存在的信息，不等于每个人物都知道。只记录对剧情有影响的信息差（秘密、隐瞒、误会、尚未公开的真相），最多 8 条。人物只有在剧情里亲眼看到、亲耳听到或被告知后才算「知情」，没有证据不要假定他知道；有迹象但没确认的放进「怀疑」。已知情的人不会忘记。不知情的人物不能说出或表现出自己知道这件事，除非接下来的节拍让他得知；让玩家角色得知信息，只能靠剧情里的线索或他人的行动，不能替玩家角色「想起来」或「领悟」。
 11. 伏笔（foreshadows）本身由 Serendipity 记录，你只规划「何时、怎样」铺垫与回收：只能处理【伏笔】列表里已有的 id，不能新增伏笔，也不能宣布某条伏笔已回收。stage 取值：sleep 暂时不碰；hint 偶尔在细节里轻轻带过；build 可以进一步铺垫；ready 时机成熟，可以创造让它浮出水面的契机。每个节拍最多自然带出一条伏笔，不要直接说破真相，也不要一次抖出多条。回收需要玩家角色做选择或行动时，只能创造契机，不能替玩家完成。nextHint 写「在场景里怎样自然带出」，revealWhen 写「什么条件下可以回收」，都要具体。hinted 表示上一轮实际剧情是否带出了这条伏笔。
 12. 「巡检发现的问题」是规则检测出的参考，不一定都是真问题。确实存在的，在下一个节拍里用剧情内的方式自然化解，不要为此破坏已有设定、不要替玩家角色做决定；判断不是问题的可以忽略。
+13. 因果链：剧情推进靠「事件引发后果」。nextBeat 应该有来由——beatCause 用一句话写出它是由哪件已经发生的事（人物的行动、被发现的线索、做出的选择）引发的，不能写「剧情需要」，找不到来由就改成别的节拍。consequences 记录已经埋下、但还没落地的后果：起因必须是剧情里实际发生的事，后果是它在世界里自然会引发的变化（他人的反应、事态发展、关系的变化、环境的改变）；status：pending 已埋下但时机未到，due 时机已到、应该开始落地，realized 上一轮实际剧情里已经发生，dismissed 因情况变化不再成立。上一轮实际发生了的标 realized；已有条目沿用原 id；每一两轮最多让一条后果落地，不要把后果一次全部兑现，也不要无限拖延。玩家角色的行动可以成为起因，但后果只能落在世界与其他人物身上，不能是替玩家角色做出的决定。
 
 只输出一个 JSON 对象，不要任何解释，不要代码块。格式：
 {
@@ -906,6 +971,7 @@ const PLANNER_SYSTEM = `你是一名角色扮演故事的「剧情规划师」�
     "emotionalTone": "当前情绪基调"
   },
   "nextBeat": "下一个节拍：一个具体的变化",
+  "beatCause": "这个节拍由哪件已经发生的事引发，一句话",
   "beatThread": "下一个节拍主要推进的剧情线（填 id 或标题），没有就留空",
   "threads": [
     { "id": "已有剧情线填原 id，新线留空", "title": "剧情线名，简短", "kind": "main / character / world", "status": "active / paused / resolved", "importance": "high / mid / low", "progress": 0, "characters": "相关人物，逗号分隔", "advanced": false }
@@ -920,12 +986,15 @@ const PLANNER_SYSTEM = `你是一名角色扮演故事的「剧情规划师」�
   "foreshadows": [
     { "id": "伏笔列表里的 id", "stage": "sleep / hint / build / ready", "nextHint": "怎样在场景里自然带出，一句话", "revealWhen": "什么条件下可以回收，一句话", "hinted": false }
   ],
+  "consequences": [
+    { "id": "已有条目填原 id，新条目留空", "cause": "已经发生的起因，一句话", "effect": "它自然会引发的后果，一句话", "status": "pending / due / realized / dismissed" }
+  ],
   "tension": 50,
   "doNot": ["本轮不要做的事，每条一句，最多 4 条"],
   "stagnation": false,
   "reason": "一句话说明你为什么这样安排"
 }
-tension 为 0 到 100 的整数；doNot 最多 4 条；knowledge 最多 8 条，threads 最多 8 条，foreshadows 只列出需要调整安排的伏笔，advanced 表示上一轮实际剧情是否推进了这条线，progress 为 0 到 100 的整数。`;
+tension 为 0 到 100 的整数；doNot 最多 4 条；knowledge 最多 8 条，consequences 最多 8 条，threads 最多 8 条，foreshadows 只列出需要调整安排的伏笔，advanced 表示上一轮实际剧情是否推进了这条线，progress 为 0 到 100 的整数。`;
 
 function planStateForPrompt(s) {
     return JSON.stringify({
@@ -948,6 +1017,7 @@ function buildPlanPrompt(cd, lastIdx) {
         threadsForPrompt(cd, s) ? '【当前剧情线（你上一轮维护的）】\n' + threadsForPrompt(cd, s) : '',
         arcsForPrompt(s) ? '【人物情绪弧线（你上一轮维护的）】\n' + arcsForPrompt(s) : '',
         knowledgeForPrompt(s) ? '【信息分布：谁知道什么（你上一轮维护的）】\n' + knowledgeForPrompt(s) : '',
+        consequencesForPrompt(cd, s) ? '【已埋下的后果（因果链，你上一轮维护的）】\n' + consequencesForPrompt(cd, s) : '',
         foreshadowsForPrompt(cd, s) ? '【伏笔（事实来自 Serendipity，安排是你上一轮维护的）】\n' + foreshadowsForPrompt(cd, s) : '',
         inspectionForPrompt(cd) ? '【巡检发现的问题（规则检测，供参考）】\n' + inspectionForPrompt(cd) : '',
         recent ? '【最近几轮的实际结果记录】\n' + recent : '',
@@ -979,7 +1049,7 @@ function applyPlan(cd, plan, msgIndex) {
         if (v) s.scene[k] = v;
     }
     const beat = cleanStr(plan.nextBeat, 200);
-    if (beat) s.currentBeat = beat;
+    if (beat) { s.currentBeat = beat; s.beatCause = cleanStr(plan.beatCause, 160); }
     const emo = cleanStr(plan.emotionalDirection, 80);
     if (emo) s.emotionalDirection = emo;
     const tension = Number(plan.tension);
@@ -992,6 +1062,7 @@ function applyPlan(cd, plan, msgIndex) {
     mergeThreads(cd, s, plan.threads);
     mergeEmotionalArcs(cd, s, plan.emotionalArcs);
     mergeKnowledge(cd, s, plan.knowledge);
+    mergeConsequences(cd, s, plan.consequences);
     syncForeshadowPlan(cd);
     mergeForeshadowPlan(cd, s, plan.foreshadows);
     const bt = findThread(s.threads, plan.beatThread);
@@ -1106,6 +1177,12 @@ function buildPlanBlock(s, cd) {
     if (sc.conflict) lines.push('当前冲突：' + sc.conflict);
     const bt = findThread(s.threads, s.beatThread);
     if (s.currentBeat) lines.push('本轮应推进的节拍：' + s.currentBeat + (bt ? '（对应剧情线：' + bt.title + '）' : ''));
+    if (s.beatCause) lines.push('这个节拍的来由：' + s.beatCause);
+    const dueC = s.consequences.filter(c => c.status === 'due').slice(0, 2);
+    if (dueC.length) {
+        lines.push('已经埋下、现在该落地的后果：' + dueC.map(c => '因为' + c.cause + '，' + c.effect).join('；'));
+        lines.push('后果要通过剧情里自然的方式落地（他人的反应、事态的发展、环境的变化），一次只推进一点，不要替 {{user}} 做决定。');
+    }
     const active = s.threads.filter(t => t.status === 'active');
     if (active.length) {
         const order = { high: 0, mid: 1, low: 2 };
@@ -1181,6 +1258,7 @@ window.Amor.getStoryDirection = function (opts) {
         emotionalArcs: clone(s.emotionalArcs),
         knowledgeState: clone(s.knowledge),
         foreshadowPlan: clone(s.foreshadowPlan),
+        causalChains: { beatCause: s.beatCause, consequences: clone(s.consequences) },
         inspection: () => inspectStory(cd),
         storyHealth: () => storyHealth(cd),
     };
@@ -1270,6 +1348,12 @@ function plannerPageHtml() {
         </div>
 
         <div class="amor__section">
+          <div class="amor__label">因果链：已埋下的后果（Amor 的判断，不是事实）</div>
+          <div class="amor__p-cons"></div>
+          <button type="button" class="amor__p-reset amor__p-ca-add">+ 添加后果</button>
+        </div>
+
+        <div class="amor__section">
           <div class="amor__label">伏笔安排（伏笔本身记录在 Serendipity，这里只规划何时、怎样铺垫与回收）</div>
           <div class="amor__p-fore"></div>
         </div>
@@ -1353,6 +1437,7 @@ function bindPlannerEvents() {
             last.state.emotionalArcs = clone(cd.directorState.emotionalArcs);
             last.state.knowledge = clone(cd.directorState.knowledge);
             last.state.foreshadowPlan = clone(cd.directorState.foreshadowPlan);
+            last.state.consequences = clone(cd.directorState.consequences);
         }
         cd.meta.updatedAt = Date.now();
         saveSettings();
@@ -1440,6 +1525,35 @@ function bindPlannerEvents() {
         if (f === 'subject') $(this).val(k.subject);
         if (f === 'fact') $(this).val(k.fact);
     });
+    panel.on('click', '.amor__p-ca-add', () => {
+        const cd = plannerEnsureChat();
+        if (!cd) { toastr.warning('请先打开一个聊天'); return; }
+        const cs = cd.directorState.consequences;
+        if (cs.filter(c => !consTerminal(c)).length >= MAX_CONS) { toastr.warning('未兑现的后果最多 ' + MAX_CONS + ' 条，请先处理一条'); return; }
+        cs.push({ id: newThreadId(cs), cause: '', effect: '', status: 'pending', lastChangedAt: cd.revision.amorRevision });
+        syncExtrasToSnapshot(cd);
+        renderConsequences(cd);
+    });
+    panel.on('click', '.amor__p-ca-del', function () {
+        const cd = plannerChatData();
+        if (!cd) return;
+        const id = $(this).closest('.amor__p-ccard').attr('data-id');
+        cd.directorState.consequences = cd.directorState.consequences.filter(c => c.id !== id);
+        syncExtrasToSnapshot(cd);
+        renderConsequences(cd);
+    });
+    panel.on('change', '.amor__p-ca', function () {
+        const cd = plannerChatData();
+        if (!cd) return;
+        const c = cd.directorState.consequences.find(x => x.id === $(this).closest('.amor__p-ccard').attr('data-id'));
+        if (!c) return;
+        const f = $(this).data('f');
+        const v = $(this).val();
+        if (f === 'status') { c.status = pickKey(v, CONS_STATUS, c.status); c.lastChangedAt = cd.revision.amorRevision; }
+        else { c[f] = cleanStr(v, f === 'cause' ? 80 : 100); $(this).val(c[f]); }
+        syncExtrasToSnapshot(cd);
+        if (f === 'status') renderConsequences(cd);
+    });
     panel.on('change', '.amor__p-fa', function () {
         const cd = plannerEnsureChat();
         if (!cd) return;
@@ -1505,6 +1619,28 @@ function renderKnowledge(cd) {
             $('<button type="button" class="amor__p-th-del amor__p-ka-del" title="删除">×</button>')));
         row.append($('<input type="text" class="amor__p-ka amor__p-ea-dir" data-f="fact" maxlength="120" placeholder="信息内容（一句话）" spellcheck="false">').val(k.fact));
         row.append(lab('知情', list('knownBy', k.knownBy)), lab('怀疑', list('suspectedBy', k.suspectedBy)), lab('不知情', list('unknownBy', k.unknownBy)));
+        box.append(row);
+    }
+}
+
+function renderConsequences(cd) {
+    const box = $('#st-amor .amor__p-cons').empty();
+    if (!cd || !cd.directorState.consequences.length) {
+        box.append($('<div class="amor__p-empty">').text(cd ? '还没有记录。剧情里出现会引发后果的事件时会自动归纳，也可以手动添加。' : '请先打开一个聊天。'));
+        return;
+    }
+    for (const c of cd.directorState.consequences) {
+        const sel = $('<select class="amor__p-ca" data-f="status">');
+        for (const k of Object.keys(CONS_STATUS)) sel.append($('<option>').val(k).text(CONS_STATUS[k]));
+        sel.val(c.status);
+        const late = c.status === 'due' && consIdle(cd, c) >= CONS_DUE_WARN;
+        const row = $('<div class="amor__p-thread amor__p-ccard">').attr('data-id', c.id).toggleClass('is-idle', late);
+        row.append($('<div class="amor__p-th-row amor__p-ea-top">').append(
+            $('<input type="text" class="amor__p-ca" data-f="cause" maxlength="80" placeholder="起因（已经发生的事）" spellcheck="false">').val(c.cause),
+            sel,
+            $('<button type="button" class="amor__p-th-del amor__p-ca-del" title="删除">×</button>')));
+        row.append($('<input type="text" class="amor__p-ca amor__p-ea-dir" data-f="effect" maxlength="100" placeholder="它自然会引发的后果" spellcheck="false">').val(c.effect));
+        if (!consTerminal(c)) row.append($('<div class="amor__p-th-meta">').text(late ? consIdle(cd, c) + ' 次规划没有落地' : consIdle(cd, c) + ' 次规划前更新'));
         box.append(row);
     }
 }
@@ -1642,6 +1778,7 @@ function renderPlanner() {
         renderArcs(null);
         renderKnowledge(null);
         renderForeshadows(null);
+        renderConsequences(null);
         renderInspection(null);
         panel.find('.amor__p-input').val('').prop('disabled', true);
         panel.find('.amor__p-outcomes').empty();
@@ -1653,6 +1790,7 @@ function renderPlanner() {
     renderArcs(cd);
     renderKnowledge(cd);
     renderForeshadows(cd);
+    renderConsequences(cd);
     renderInspection(cd);
     panel.find('.amor__p-input').prop('disabled', false).each(function () {
         const v = getPath(s, $(this).data('path'));
