@@ -422,6 +422,15 @@
 #st-amor .amor__p-chip.lv-high { color: var(--amor-text); border-color: var(--amor-accent); }
 #st-amor .amor__p-choice-run:disabled { opacity: 0.5; cursor: default; }
 
+/* 故事大阶段 */
+#st-amor .amor__p-chain { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-bottom: 14px; }
+#st-amor .amor__p-step { padding: 3px 10px; font-size: 12px; border: 1px solid var(--amor-border); border-radius: 10px; color: var(--amor-text-soft); }
+#st-amor .amor__p-step + .amor__p-step::before { content: "→"; margin-right: 6px; margin-left: -4px; color: var(--amor-text-soft); }
+#st-amor .amor__p-step.is-done { opacity: 0.7; }
+#st-amor .amor__p-step.is-now { background: var(--amor-dark); border-color: var(--amor-dark); color: #fff; }
+#st-amor .amor__p-step.is-now::before { color: var(--amor-text-soft); }
+#st-amor .amor__p-step.is-next { border-style: dashed; }
+
 /* 移动端 */
 @media (max-width: 480px) {
     #st-amor .amor__body { padding: 16px 14px 40px; }

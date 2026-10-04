@@ -17,7 +17,7 @@ import { selected_group } from '../../../group-chats.js';
 import { getStringHash } from '../../../utils.js';
 
 const extensionName = 'amor';
-const VERSION = '1.10.0';
+const VERSION = '1.10.1';
 
 // ---------------- 维度常量 ----------------
 const RHYTHMS = ['平缓', '日常', '暧昧', '紧张', '冲突', '高潮', '余波'];
@@ -308,6 +308,8 @@ const PLAN_INJECT_DEPTH = 1;     // 0 = 最末尾，1 = 倒数第二条之前
 const MAX_SNAPSHOTS = 20;        // 每轮规划留一份快照，用于删除/重生成/Swipe 时回滚（存在酒馆设置里，别留太多）
 const MAX_OUTCOMES = 30;
 const MAX_THREADS = 8;
+const MAX_ARC_DONE = 8;          // 故事大阶段：已走过的阶段最多留几个
+const MAX_ARC_NEXT = 3;
 const MAX_ARCS = 5;
 const MAX_KNOWLEDGE = 8;
 const MAX_KNOW_NAMES = 6;
@@ -354,6 +356,8 @@ const MIN_NEW_CHARS = 150;       // 距上次规划新增的正文少于这个�
 const TRANSCRIPT_CHARS = 1200;   // 单条消息截断长度
 
 const PLAN_FIELDS = [
+    { path: 'arc.stage', label: '当前大阶段（整个故事走到哪一幕，几个字）', rows: 1 },
+    { path: 'arc.summary', label: '这个阶段在讲什么', rows: 2 },
     { path: 'scene.situation', label: '当前场景', rows: 2 },
     { path: 'scene.location', label: '地点', rows: 1 },
     { path: 'scene.participants', label: '在场人物', rows: 1 },
@@ -388,6 +392,7 @@ function freshPlanState() {
         foreshadowPlan: [],
         consequences: [],
         beatCause: '',
+        arc: { stage: '', summary: '', done: [], next: [] },
         doctorOrders: [],
         stagnantRounds: 0,
         lastDecision: '',
@@ -424,6 +429,11 @@ function normalizePlanChat(cd) {
     if (!Array.isArray(cd.directorState.foreshadowPlan)) cd.directorState.foreshadowPlan = [];
     if (!Array.isArray(cd.directorState.consequences)) cd.directorState.consequences = [];
     if (typeof cd.directorState.beatCause !== 'string') cd.directorState.beatCause = '';
+    cd.directorState.arc = Object.assign(freshPlanState().arc, (cd.directorState.arc && typeof cd.directorState.arc === 'object') ? cd.directorState.arc : {});
+    if (typeof cd.directorState.arc.stage !== 'string') cd.directorState.arc.stage = '';
+    if (typeof cd.directorState.arc.summary !== 'string') cd.directorState.arc.summary = '';
+    if (!Array.isArray(cd.directorState.arc.done)) cd.directorState.arc.done = [];
+    if (!Array.isArray(cd.directorState.arc.next)) cd.directorState.arc.next = [];
     if (!Array.isArray(cd.directorState.doctorOrders)) cd.directorState.doctorOrders = [];
     if (!cd.doctor || typeof cd.doctor !== 'object' || !Array.isArray(cd.doctor.rx)) cd.doctor = null;
     if (!cd.choices || typeof cd.choices !== 'object' || !Array.isArray(cd.choices.options)) cd.choices = null;
@@ -1086,6 +1096,7 @@ const PLANNER_SYSTEM = `你是一名角色扮演故事的「剧情规划师」�
 12. 「巡检发现的问题」是规则检测出的参考，不一定都是真问题。确实存在的，在下一个节拍里用剧情内的方式自然化解，不要为此破坏已有设定、不要替玩家角色做决定；判断不是问题的可以忽略。
 13. 因果链：剧情推进靠「事件引发后果」。nextBeat 应该有来由——beatCause 用一句话写出它是由哪件已经发生的事（人物的行动、被发现的线索、做出的选择）引发的，不能写「剧情需要」，找不到来由就改成别的节拍。consequences 记录已经埋下、但还没落地的后果：起因必须是剧情里实际发生的事，后果是它在世界里自然会引发的变化（他人的反应、事态发展、关系的变化、环境的改变）；status：pending 已埋下但时机未到，due 时机已到、应该开始落地，realized 上一轮实际剧情里已经发生，dismissed 因情况变化不再成立。上一轮实际发生了的标 realized；已有条目沿用原 id；每一两轮最多让一条后果落地，不要把后果一次全部兑现，也不要无限拖延。玩家角色的行动可以成为起因，但后果只能落在世界与其他人物身上，不能是替玩家角色做出的决定。
 14. 「已采纳的医嘱」是用户确认过的修正方向：nextBeat 应当以剧情内自然的方式体现它（有多条时体现最合适的一条），但仍要遵守以上所有规则，尤其是不替玩家角色做决定。
+15. 故事大阶段（arc）是整个故事当前走到哪一幕的粗略判断，比剧情线和场景都更大、更慢。不要每轮重写：只有当剧情里发生了真正的阶段转折（关系、局面或主要矛盾发生质变）时，才修改 stage；否则 stage 原样沿用上一轮的写法，summary 也只在需要时微调。stage 用几个字概括（如「关系建立」「冲突升级」），summary 一两句话说明这个阶段在讲什么，next 是你预期的后续阶段（最多 3 个，只是预期，会随实际剧情改变，不是必须发生的剧本）。阶段是你对故事的解释，不是事实；不要因为阶段设定而改变已知事实，也不要因为想进入下一阶段就催促玩家角色做决定。
 
 只输出一个 JSON 对象，不要任何解释，不要代码块。格式：
 {
@@ -1118,6 +1129,7 @@ const PLANNER_SYSTEM = `你是一名角色扮演故事的「剧情规划师」�
   "consequences": [
     { "id": "已有条目填原 id，新条目留空", "cause": "已经发生的起因，一句话", "effect": "它自然会引发的后果，一句话", "status": "pending / due / realized / dismissed" }
   ],
+  "arc": { "stage": "当前大阶段，几个字；没有真正转折就沿用上一轮", "summary": "这个阶段在讲什么，一两句话", "next": ["预期的后续阶段，最多 3 个"] },
   "tension": 50,
   "doNot": ["本轮不要做的事，每条一句，最多 4 条"],
   "stagnation": false,
@@ -1143,6 +1155,7 @@ function buildPlanPrompt(cd, lastIdx, urgent) {
     return [
         '【已知事实（来自 Serendipity）】\n' + (facts || '（没有可用的 Serendipity 事实，请只依据最近剧情）'),
         '【上一轮规划状态】\n' + (hasState ? planStateForPrompt(s) : '（尚无规划状态，这是第一次规划）'),
+        arcForPrompt(s) ? '【故事大阶段（你上一轮维护的）】\n' + arcForPrompt(s) : '',
         threadsForPrompt(cd, s) ? '【当前剧情线（你上一轮维护的）】\n' + threadsForPrompt(cd, s) : '',
         arcsForPrompt(s) ? '【人物情绪弧线（你上一轮维护的）】\n' + arcsForPrompt(s) : '',
         knowledgeForPrompt(s) ? '【信息分布：谁知道什么（你上一轮维护的）】\n' + knowledgeForPrompt(s) : '',
@@ -1166,6 +1179,30 @@ function parsePlanJson(text) {
     const b = t.lastIndexOf('}');
     if (a < 0 || b <= a) throw new Error('规划返回的不是 JSON');
     return JSON.parse(t.slice(a, b + 1));
+}
+
+function mergeStoryArc(s, a) {
+    if (!a || typeof a !== 'object') return;
+    const arc = s.arc;
+    const stage = cleanStr(a.stage, 30);
+    if (stage && stage !== arc.stage) {
+        if (arc.stage && !arc.done.includes(arc.stage)) arc.done.push(arc.stage);
+        if (arc.done.length > MAX_ARC_DONE) arc.done.splice(0, arc.done.length - MAX_ARC_DONE);
+        arc.stage = stage;
+        arc.summary = '';
+    }
+    const summary = cleanStr(a.summary, 160);
+    if (summary) arc.summary = summary;
+    if (Array.isArray(a.next)) arc.next = a.next.map(x => cleanStr(x, 30)).filter(x => x && x !== arc.stage).slice(0, MAX_ARC_NEXT);
+}
+function arcForPrompt(s) {
+    const a = s.arc;
+    if (!a.stage && !a.summary) return '';
+    return [
+        '当前大阶段：' + (a.stage || '（未定）') + (a.summary ? '——' + a.summary : ''),
+        a.done.length ? '已走过：' + a.done.join(' → ') : '',
+        a.next.length ? '预期后续：' + a.next.join(' → ') : '',
+    ].filter(Boolean).join('\n');
 }
 
 function applyPlan(cd, plan, msgIndex) {
@@ -1192,6 +1229,7 @@ function applyPlan(cd, plan, msgIndex) {
     cd.revision.amorRevision += 1;
     cd.revision.lastProcessedMessageIndex = msgIndex;
     s.doctorOrders = s.doctorOrders.filter(o => o.expiresAt > cd.revision.amorRevision);
+    mergeStoryArc(s, plan.arc);
     mergeThreads(cd, s, plan.threads);
     mergeEmotionalArcs(cd, s, plan.emotionalArcs);
     mergeKnowledge(cd, s, plan.knowledge);
@@ -1333,6 +1371,7 @@ function buildDoctorPrompt(cd, lastIdx) {
     return [
         '【已知事实（来自 Serendipity）】\n' + (facts || '（没有可用的 Serendipity 事实，请只依据最近剧情）'),
         '【当前规划状态】\n' + (hasState ? planStateForPrompt(s) : '（尚无规划状态）') + (s.beatCause ? '\n节拍起因：' + s.beatCause : '') + (s.stagnantRounds ? '\n已连续 ' + s.stagnantRounds + ' 轮被判定为空转' : ''),
+        arcForPrompt(s) ? '【故事大阶段】\n' + arcForPrompt(s) : '',
         threadsForPrompt(cd, s) ? '【剧情线】\n' + threadsForPrompt(cd, s) : '',
         arcsForPrompt(s) ? '【人物情绪】\n' + arcsForPrompt(s) : '',
         knowledgeForPrompt(s) ? '【信息分布】\n' + knowledgeForPrompt(s) : '',
@@ -1506,6 +1545,7 @@ function plannerReconcile() {
     const last = valid[valid.length - 1];
     cd.snapshots = valid;
     cd.directorState = last ? clone(last.state) : freshPlanState();
+    normalizePlanChat(cd);
     cd.revision.lastProcessedMessageIndex = last ? last.msgIndex : -1;
     cd.outcomes = cd.outcomes.filter(o => o.msgIndex <= cd.revision.lastProcessedMessageIndex);
     cd.lastSeenKey = '';
@@ -1521,6 +1561,7 @@ function buildPlanBlock(s, cd) {
     if (!s.currentBeat && !s.scene.objective) return '';
     const sc = s.scene;
     const lines = [];
+    if (s.arc.stage) lines.push('故事当前所处的大阶段：' + s.arc.stage + (s.arc.summary ? '（' + s.arc.summary + '）' : '') + '。这是背景方向，不要因此提前结束当前阶段或催促 {{user}} 做决定。');
     if (sc.situation) lines.push('当前场景：' + sc.situation);
     if (sc.location) lines.push('地点：' + sc.location);
     if (sc.participants) lines.push('在场人物：' + sc.participants);
@@ -1616,6 +1657,7 @@ window.Amor.getStoryDirection = function (opts) {
         choices: (cd.choices && choicesValid(cd)) ? clone(cd.choices) : null,
         doctorOrders: clone(s.doctorOrders),
         doctorReport: (cd.doctor && doctorValid(cd)) ? clone(cd.doctor) : null,
+        storyArc: clone(s.arc),
         causalChains: { beatCause: s.beatCause, consequences: clone(s.consequences) },
         inspection: () => inspectStory(cd),
         storyHealth: () => storyHealth(cd),
@@ -1633,16 +1675,18 @@ function getPath(s, path) {
 function setPath(s, path, v) {
     const ks = path.split('.');
     const last = ks.pop();
-    const o = ks.reduce((x, k) => x[k], s);
+    const o = ks.reduce((x, k) => (x[k] && typeof x[k] === 'object') ? x[k] : (x[k] = {}), s);
     o[last] = v;
 }
 
 function plannerPageHtml() {
-    const fieldsHtml = PLAN_FIELDS.map(f => `
+    const fieldHtml = f => `
           <div class="amor__p-field">
             <div class="amor__p-field-label">${f.label}</div>
             <textarea class="amor__p-text amor__p-input" data-path="${f.path}" rows="${f.rows}" spellcheck="false"></textarea>
-          </div>`).join('');
+          </div>`;
+    const fieldsHtml = PLAN_FIELDS.filter(f => !f.path.startsWith('arc.')).map(fieldHtml).join('');
+    const arcFieldsHtml = PLAN_FIELDS.filter(f => f.path.startsWith('arc.')).map(fieldHtml).join('');
     return `
       <div class="amor__body amor__pbody" data-page="planner" style="display:none">
         <div class="amor__master">
@@ -1687,6 +1731,12 @@ function plannerPageHtml() {
           <div class="amor__p-field"><textarea class="amor__p-text amor__p-choice-focus" rows="2" spellcheck="false" placeholder="想考虑的问题（可留空，默认围绕眼下最需要决定的事）"></textarea></div>
           <div class="amor__auto-ctl-row"><button type="button" class="amor__direct-now amor__p-choice-run">生成选项</button></div>
           <div class="amor__p-choices"></div>
+        </div>
+
+        <div class="amor__section">
+          <div class="amor__label">故事大阶段（整个故事走到哪一幕；只在出现真正转折时才会变，是解释不是事实）</div>
+          <div class="amor__p-arcchain"></div>
+          ${arcFieldsHtml}
         </div>
 
         <div class="amor__section">
@@ -1815,6 +1865,7 @@ function bindPlannerEvents() {
             last.state.foreshadowPlan = clone(cd.directorState.foreshadowPlan);
             last.state.consequences = clone(cd.directorState.consequences);
             last.state.doctorOrders = clone(cd.directorState.doctorOrders);
+            last.state.arc = clone(cd.directorState.arc);
         }
         cd.meta.updatedAt = Date.now();
         saveSettings();
@@ -2254,6 +2305,20 @@ function setPlannerStatus(text) {
     $('#st-amor .amor__p-status').text(text || '');
 }
 
+function renderStoryArc(cd) {
+    const box = $('#st-amor .amor__p-arcchain').empty();
+    const a = cd && cd.directorState.arc;
+    if (!a || (!a.stage && !a.done.length)) {
+        box.append($('<div class="amor__p-empty">').text(cd ? '还没有记录。规划几轮后会自动归纳，也可以在下面手动填写。' : '请先打开一个聊天。'));
+        return;
+    }
+    const chain = $('<div class="amor__p-chain">');
+    a.done.forEach(x => chain.append($('<span class="amor__p-step is-done">').text(x)));
+    if (a.stage) chain.append($('<span class="amor__p-step is-now">').text(a.stage));
+    a.next.forEach(x => chain.append($('<span class="amor__p-step is-next">').text(x)));
+    box.append(chain);
+}
+
 function renderPlanner() {
     const panel = $('#st-amor');
     if (!panel.length || !settings.planner) return;
@@ -2268,6 +2333,7 @@ function renderPlanner() {
 
     const cd = currentChatKey() ? (plannerChatData() || freshPlanChat()) : null;
     if (!cd) {
+        renderStoryArc(null);
         renderThreads(null);
         renderArcs(null);
         renderKnowledge(null);
@@ -2282,6 +2348,7 @@ function renderPlanner() {
         return;
     }
     const s = cd.directorState;
+    renderStoryArc(cd);
     renderThreads(cd);
     renderArcs(cd);
     renderKnowledge(cd);
