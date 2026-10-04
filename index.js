@@ -2,6 +2,7 @@ import { extension_settings } from '../../../extensions.js';
 import {
     chat,
     generateRaw,
+    getRequestHeaders,
     eventSource,
     event_types,
     setExtensionPrompt,
@@ -16,7 +17,7 @@ import { selected_group } from '../../../group-chats.js';
 import { getStringHash } from '../../../utils.js';
 
 const extensionName = 'amor';
-const VERSION = '1.9.0';
+const VERSION = '1.9.1';
 
 // ---------------- 维度常量 ----------------
 const RHYTHMS = ['平缓', '日常', '暧昧', '紧张', '冲突', '高潮', '余波'];
@@ -544,7 +545,68 @@ function withTimeout(p, ms) {
     const timeout = new Promise((_, rej) => { t = setTimeout(() => rej(new Error('请求超时（' + Math.round(ms / 1000) + ' 秒）')), ms); });
     return Promise.race([p, timeout]).finally(() => clearTimeout(t));
 }
+function plannerBaseUrl(url) {
+    return String(url || '').trim().replace(/\/+$/, '').replace(/\/chat\/completions$/i, '');
+}
+// 经酒馆服务器转发：由服务器发出请求，不受浏览器跨域（CORS）限制。
+// Authorization 总是显式给出（没填 Key 就留空），避免酒馆里保存的其它 Key 被带到这个地址
+async function callPlannerViaServer({ prompt, systemPrompt }) {
+    const c = settings.planner.api;
+    const messages = [];
+    if (systemPrompt) messages.push({ role: 'system', content: systemPrompt });
+    messages.push({ role: 'user', content: prompt });
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), PLAN_TIMEOUT_MS);
+    let res;
+    try {
+        res = await fetch('/api/backends/chat-completions/generate', {
+            method: 'POST',
+            headers: getRequestHeaders(),
+            body: JSON.stringify({
+                chat_completion_source: 'custom',
+                custom_url: plannerBaseUrl(c.url),
+                custom_include_headers: 'Authorization: ' + JSON.stringify(c.key ? 'Bearer ' + c.key.trim() : '') + '\n',
+                model: c.model.trim(),
+                messages,
+                stream: false,
+            }),
+            signal: ctrl.signal,
+        });
+    } catch (e) {
+        if (e && e.name === 'AbortError') throw new Error('请求超时（' + Math.round(PLAN_TIMEOUT_MS / 1000) + ' 秒）');
+        const err = new Error(safeErrorText(e, c.key) || '网络请求失败');
+        err.unreachable = true;
+        throw err;
+    } finally {
+        clearTimeout(timer);
+    }
+    // 酒馆没有这个接口（404 / 405 / 被拦截）时，交给调用方回退到浏览器直连
+    if (res.status === 404 || res.status === 405 || res.status === 403 || res.status === 401) {
+        const err = new Error('酒馆转发接口不可用（HTTP ' + res.status + '）');
+        err.unreachable = true;
+        throw err;
+    }
+    const text = await res.text().catch(() => '');
+    let d = null;
+    try { d = JSON.parse(text); } catch (e) { /* 非 JSON */ }
+    if (!res.ok || (d && d.error)) {
+        const msg = d && d.error && (d.error.message || (typeof d.error === 'string' ? d.error : ''));
+        throw new Error('HTTP ' + res.status + ' ' + safeErrorText(msg || text, c.key));
+    }
+    const out = d && d.choices && d.choices[0] && d.choices[0].message && d.choices[0].message.content;
+    if (!out) throw new Error('返回内容为空');
+    return out;
+}
 async function callPlannerApi({ prompt, systemPrompt }) {
+    try {
+        return await callPlannerViaServer({ prompt, systemPrompt });
+    } catch (e) {
+        if (!e || !e.unreachable) throw e;
+        console.warn('[Amor] 酒馆转发不可用，改用浏览器直连：', e.message);
+    }
+    return callPlannerApiDirect({ prompt, systemPrompt });
+}
+async function callPlannerApiDirect({ prompt, systemPrompt }) {
     const c = settings.planner.api;
     const headers = { 'Content-Type': 'application/json' };
     if (c.key) headers.Authorization = 'Bearer ' + c.key.trim();
@@ -563,7 +625,8 @@ async function callPlannerApi({ prompt, systemPrompt }) {
         });
     } catch (e) {
         if (e && e.name === 'AbortError') throw new Error('请求超时（' + Math.round(PLAN_TIMEOUT_MS / 1000) + ' 秒）');
-        throw new Error(safeErrorText(e, c.key) || '网络请求失败');
+        const m = safeErrorText(e, c.key) || '网络请求失败';
+        throw new Error(/failed to fetch|networkerror|load failed/i.test(m) ? '浏览器直连被拦截（多半是对方服务不允许跨域），请检查地址是否可达' : m);
     } finally {
         clearTimeout(timer);
     }
