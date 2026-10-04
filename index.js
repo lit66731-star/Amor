@@ -10,12 +10,13 @@ import {
     chat_metadata,
     characters,
     this_chid,
+    name1,
 } from '../../../../script.js';
 import { selected_group } from '../../../group-chats.js';
 import { getStringHash } from '../../../utils.js';
 
 const extensionName = 'amor';
-const VERSION = '1.4.0';
+const VERSION = '1.5.0';
 
 // ---------------- 维度常量 ----------------
 const RHYTHMS = ['平缓', '日常', '暧昧', '紧张', '冲突', '高潮', '余波'];
@@ -278,6 +279,9 @@ const PLAN_INJECT_DEPTH = 1;     // 0 = 最末尾，1 = 倒数第二条之前
 const MAX_SNAPSHOTS = 20;        // 每轮规划留一份快照，用于删除/重生成/Swipe 时回滚（存在酒馆设置里，别留太多）
 const MAX_OUTCOMES = 30;
 const MAX_THREADS = 8;
+const MAX_ARCS = 5;
+const MAX_ARC_HISTORY = 5;
+const ARC_RECENT = 3;           // 最近这么多次规划内发生的情绪变化，才会写进注入
 const THREAD_KINDS = { main: '主线', character: '人物线', world: '世界线' };
 const THREAD_STATUS = { active: '进行中', paused: '暂停', resolved: '已完结' };
 const THREAD_IMPORTANCE = { high: '高', mid: '中', low: '低' };
@@ -315,6 +319,7 @@ function freshPlanState() {
         doNot: [],
         threads: [],
         beatThread: '',
+        emotionalArcs: [],
         stagnantRounds: 0,
         lastDecision: '',
     };
@@ -341,6 +346,7 @@ function normalizePlanChat(cd) {
     if (!Array.isArray(cd.directorState.doNot)) cd.directorState.doNot = [];
     if (!Array.isArray(cd.directorState.threads)) cd.directorState.threads = [];
     if (typeof cd.directorState.beatThread !== 'string') cd.directorState.beatThread = '';
+    if (!Array.isArray(cd.directorState.emotionalArcs)) cd.directorState.emotionalArcs = [];
     if (!Array.isArray(cd.snapshots)) cd.snapshots = [];
     if (!Array.isArray(cd.outcomes)) cd.outcomes = [];
     if (typeof cd.lastSeenKey !== 'string') cd.lastSeenKey = '';
@@ -603,6 +609,45 @@ function threadsForPrompt(cd, s) {
     }).join('\n');
 }
 
+// ---- 情绪弧线（Emotional Arc）：关注情绪「为什么变化」，不记数值 ----
+const isPlayerName = (n) => !!n && typeof name1 === 'string' && n.trim() === name1.trim();
+function mergeEmotionalArcs(cd, s, list) {
+    if (!Array.isArray(list)) return;
+    const rev = cd.revision.amorRevision;
+    for (const raw of list.slice(0, MAX_ARCS + 2)) {
+        if (!raw || typeof raw !== 'object') continue;
+        const character = cleanStr(raw.character, 20);
+        if (!character) continue;
+        const cur = cleanStr(raw.current, 30);
+        let arc = s.emotionalArcs.find(a => a.character === character);
+        if (!arc) {
+            if (!cur) continue;
+            arc = { id: newThreadId(s.emotionalArcs), character, current: cur, direction: '', history: [], lastChangedAt: rev };
+            s.emotionalArcs.push(arc);
+        } else if (cur && cur !== arc.current) {
+            arc.history.push({ from: arc.current, to: cur, cause: cleanStr(raw.cause, 80), at: rev });
+            if (arc.history.length > MAX_ARC_HISTORY) arc.history.splice(0, arc.history.length - MAX_ARC_HISTORY);
+            arc.current = cur;
+            arc.lastChangedAt = rev;
+        }
+        // 玩家角色只记录已经表现出来的情绪，不规划其内心走向
+        if (isPlayerName(character)) arc.direction = '';
+        else if (typeof raw.direction === 'string') arc.direction = cleanStr(raw.direction, 60);
+    }
+    while (s.emotionalArcs.length > MAX_ARCS) {
+        let oldest = 0;
+        for (let i = 1; i < s.emotionalArcs.length; i++) if (s.emotionalArcs[i].lastChangedAt < s.emotionalArcs[oldest].lastChangedAt) oldest = i;
+        s.emotionalArcs.splice(oldest, 1);
+    }
+}
+function arcsForPrompt(s) {
+    if (!s.emotionalArcs.length) return '';
+    return s.emotionalArcs.map(a => {
+        const hist = a.history.slice(-3).map(h => `${h.from}→${h.to}${h.cause ? '（' + h.cause + '）' : ''}`).join('；');
+        return `- ${a.character}${isPlayerName(a.character) ? '（玩家角色）' : ''} | 当前：${a.current}` + (hist ? ' | 近期变化：' + hist : '') + (a.direction ? ' | 倾向：' + a.direction : '');
+    }).join('\n');
+}
+
 // ---- 规划 ----
 const PLANNER_SYSTEM = `你是一名角色扮演故事的「剧情规划师」。你不写正文，只负责判断剧情现在走到了哪里，并决定下一步应该发生什么。
 
@@ -615,6 +660,7 @@ const PLANNER_SYSTEM = `你是一名角色扮演故事的「剧情规划师」�
 6. 自然事件优先于强制剧情；不要直接揭示真相或一次性抖出所有伏笔。
 7. 尊重人物已有的性格、关系和知识范围，不让人物说出自己不可能知道的信息。
 8. 剧情线（threads）是你对故事脉络的归纳（主线、人物线、世界线），是解释，不是事实。只归纳已知事实和实际剧情里确实存在的持续线索；出现新的持续性矛盾、目标或悬念时才新增，不要凭空编造；某条线已经收束就把 status 设为 resolved。已有剧情线必须沿用原 id。每个节拍尽量推进一条剧情线，标注了「需要优先考虑」的线优先。
+9. 情绪弧线（emotionalArcs）关注人物情绪「为什么变化」，不记数值。只为情绪有明显变化、或对接下来的节拍很重要的人物记录（最多 4 人）。current 用一两个词；与上一轮相比发生变化时，cause 必须是剧情里实际发生的具体事件，不能写「剧情需要」。情绪变化要有铺垫，没有足以引发它的事件时，不要让人物情绪突变。玩家角色只记录已经表现出来的情绪，direction 留空。
 
 只输出一个 JSON 对象，不要任何解释，不要代码块。格式：
 {
@@ -634,6 +680,9 @@ const PLANNER_SYSTEM = `你是一名角色扮演故事的「剧情规划师」�
     { "id": "已有剧情线填原 id，新线留空", "title": "剧情线名，简短", "kind": "main / character / world", "status": "active / paused / resolved", "importance": "high / mid / low", "progress": 0, "characters": "相关人物，逗号分隔", "advanced": false }
   ],
   "emotionalDirection": "情绪走向，用「甲 → 乙」的形式写出起点和终点",
+  "emotionalArcs": [
+    { "character": "人物名", "current": "当前情绪，一两个词", "cause": "与上一轮相比若发生变化，写实际发生的原因，一句话；没变化留空", "direction": "接下来情绪可能的走向，一句话；玩家角色留空" }
+  ],
   "tension": 50,
   "doNot": ["本轮不要做的事，每条一句，最多 4 条"],
   "stagnation": false,
@@ -660,6 +709,7 @@ function buildPlanPrompt(cd, lastIdx) {
         '【已知事实（来自 Serendipity）】\n' + (facts || '（没有可用的 Serendipity 事实，请只依据最近剧情）'),
         '【上一轮规划状态】\n' + (hasState ? planStateForPrompt(s) : '（尚无规划状态，这是第一次规划）'),
         threadsForPrompt(cd, s) ? '【当前剧情线（你上一轮维护的）】\n' + threadsForPrompt(cd, s) : '',
+        arcsForPrompt(s) ? '【人物情绪弧线（你上一轮维护的）】\n' + arcsForPrompt(s) : '',
         recent ? '【最近几轮的实际结果记录】\n' + recent : '',
         '【最近剧情】\n' + buildPlanTranscript(lastIdx),
         '请按规则输出 JSON。',
@@ -700,6 +750,7 @@ function applyPlan(cd, plan, msgIndex) {
     cd.revision.amorRevision += 1;
     cd.revision.lastProcessedMessageIndex = msgIndex;
     mergeThreads(cd, s, plan.threads);
+    mergeEmotionalArcs(cd, s, plan.emotionalArcs);
     const bt = findThread(s.threads, plan.beatThread);
     s.beatThread = bt ? bt.id : '';
     cd.roundsSincePlan = 0;
@@ -818,6 +869,15 @@ function buildPlanBlock(s, cd) {
         const idle = active.filter(t => t.importance !== 'low' && threadIdle(cd, t) >= THREAD_IDLE_WARN && (!bt || bt.id !== t.id));
         if (idle.length) lines.push('久未推进的剧情线：' + idle.map(t => t.title).join('、') + '（适当让它们在场景里有所体现，不必强行推进）');
     }
+    const arcs = s.emotionalArcs.filter(a => a.current);
+    if (arcs.length) {
+        lines.push('人物情绪：' + arcs.slice(0, 4).map(a => {
+            const h = a.history[a.history.length - 1];
+            const why = h && h.cause && cd.revision.amorRevision - h.at <= ARC_RECENT ? '，因' + h.cause : '';
+            return a.character + '目前' + a.current + why + (a.direction ? '，可导向' + a.direction : '');
+        }).join('；'));
+        lines.push('人物情绪的变化要有原因和铺垫，不要无缘由突变。');
+    }
     if (s.emotionalDirection || sc.emotionalTone) lines.push('情绪方向：' + (s.emotionalDirection || sc.emotionalTone));
     if (s.stagnantRounds >= 1) lines.push('剧情近期有空转迹象，请让这一轮产生明确的变化。');
     if (s.doNot.length) lines.push('本轮避免：' + s.doNot.join('；'));
@@ -851,6 +911,7 @@ window.Amor.getStoryDirection = function (opts) {
         directorState: clone(s),
         activeGoals: s.scene.objective ? [s.scene.objective] : [],
         plotThreads: clone(s.threads),
+        emotionalArcs: clone(s.emotionalArcs),
     };
     const include = opts && Array.isArray(opts.include) ? opts.include : null;
     const out = { revision: clone(cd.revision) };
@@ -913,6 +974,12 @@ function plannerPageHtml() {
           <div class="amor__label">剧情线（Amor 对故事脉络的归纳，不是事实）</div>
           <div class="amor__p-threads"></div>
           <button type="button" class="amor__p-reset amor__p-th-add">+ 添加剧情线</button>
+        </div>
+
+        <div class="amor__section">
+          <div class="amor__label">人物情绪弧线（Amor 的归纳，不是事实）</div>
+          <div class="amor__p-arcs"></div>
+          <button type="button" class="amor__p-reset amor__p-ea-add">+ 添加人物情绪</button>
         </div>
 
         <div class="amor__section">
@@ -988,7 +1055,11 @@ function bindPlannerEvents() {
     // 剧情线：手动增删改，同步到最新快照，避免回滚时被冲掉
     const syncThreadsToSnapshot = (cd) => {
         const last = cd.snapshots[cd.snapshots.length - 1];
-        if (last) { last.state.threads = clone(cd.directorState.threads); last.state.beatThread = cd.directorState.beatThread; }
+        if (last) {
+            last.state.threads = clone(cd.directorState.threads);
+            last.state.beatThread = cd.directorState.beatThread;
+            last.state.emotionalArcs = clone(cd.directorState.emotionalArcs);
+        }
         cd.meta.updatedAt = Date.now();
         saveSettings();
         updatePlannerInjection();
@@ -1010,6 +1081,34 @@ function bindPlannerEvents() {
         if (cd.directorState.beatThread === id) cd.directorState.beatThread = '';
         syncThreadsToSnapshot(cd);
         renderThreads(cd);
+    });
+    panel.on('click', '.amor__p-ea-add', () => {
+        const cd = plannerEnsureChat();
+        if (!cd) { toastr.warning('请先打开一个聊天'); return; }
+        const arcs = cd.directorState.emotionalArcs;
+        if (arcs.length >= MAX_ARCS) { toastr.warning('最多记录 ' + MAX_ARCS + ' 位人物，请先删除一位'); return; }
+        arcs.push({ id: newThreadId(arcs), character: '', current: '', direction: '', history: [], lastChangedAt: cd.revision.amorRevision });
+        syncThreadsToSnapshot(cd);
+        renderArcs(cd);
+    });
+    panel.on('click', '.amor__p-ea-del', function () {
+        const cd = plannerChatData();
+        if (!cd) return;
+        const id = $(this).closest('.amor__p-arc').data('id');
+        cd.directorState.emotionalArcs = cd.directorState.emotionalArcs.filter(a => a.id !== id);
+        syncThreadsToSnapshot(cd);
+        renderArcs(cd);
+    });
+    panel.on('change', '.amor__p-ea', function () {
+        const cd = plannerChatData();
+        if (!cd) return;
+        const a = cd.directorState.emotionalArcs.find(x => x.id === $(this).closest('.amor__p-arc').data('id'));
+        if (!a) return;
+        const f = $(this).data('f');
+        a[f] = cleanStr($(this).val(), f === 'character' ? 20 : (f === 'current' ? 30 : 60));
+        if (f === 'direction' && isPlayerName(a.character)) a.direction = '';
+        $(this).val(a[f]);
+        syncThreadsToSnapshot(cd);
     });
     panel.on('change', '.amor__p-th', function () {
         const cd = plannerChatData();
@@ -1043,6 +1142,29 @@ function bindPlannerEvents() {
         settings.planner.api[$(this).data('api')] = String($(this).val()).trim();
         saveSettings();
     });
+}
+
+function renderArcs(cd) {
+    const box = $('#st-amor .amor__p-arcs').empty();
+    if (!cd || !cd.directorState.emotionalArcs.length) {
+        box.append($('<div class="amor__p-empty">').text(cd ? '还没有记录。规划几轮后会自动归纳，也可以手动添加。' : '请先打开一个聊天。'));
+        return;
+    }
+    for (const a of cd.directorState.emotionalArcs) {
+        const row = $('<div class="amor__p-thread amor__p-arc">').attr('data-id', a.id);
+        row.append($('<div class="amor__p-th-row amor__p-ea-top">').append(
+            $('<input type="text" class="amor__p-ea" data-f="character" maxlength="20" placeholder="人物" spellcheck="false">').val(a.character),
+            $('<input type="text" class="amor__p-ea" data-f="current" maxlength="30" placeholder="当前情绪" spellcheck="false">').val(a.current),
+            $('<button type="button" class="amor__p-th-del amor__p-ea-del" title="删除">×</button>')));
+        row.append($('<input type="text" class="amor__p-ea amor__p-ea-dir" data-f="direction" maxlength="60" spellcheck="false">')
+            .attr('placeholder', isPlayerName(a.character) ? '玩家角色不规划内心走向' : '情绪倾向（可留空）').val(a.direction));
+        if (a.history.length) {
+            const chain = a.history.map(h => h.from + ' → ' + h.to).join('，');
+            const last = a.history[a.history.length - 1];
+            row.append($('<div class="amor__p-th-meta">').text(chain + (last.cause ? '（最近：' + last.cause + '）' : '')));
+        }
+        box.append(row);
+    }
 }
 
 function renderThreads(cd) {
@@ -1090,6 +1212,7 @@ function renderPlanner() {
     const cd = currentChatKey() ? (plannerChatData() || freshPlanChat()) : null;
     if (!cd) {
         renderThreads(null);
+        renderArcs(null);
         panel.find('.amor__p-input').val('').prop('disabled', true);
         panel.find('.amor__p-outcomes').empty();
         panel.find('.amor__p-decision').text('请先打开一个聊天。');
@@ -1097,6 +1220,7 @@ function renderPlanner() {
     }
     const s = cd.directorState;
     renderThreads(cd);
+    renderArcs(cd);
     panel.find('.amor__p-input').prop('disabled', false).each(function () {
         const v = getPath(s, $(this).data('path'));
         $(this).val(Array.isArray(v) ? v.join('\n') : (v || ''));
