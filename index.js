@@ -17,7 +17,7 @@ import { selected_group } from '../../../group-chats.js';
 import { getStringHash } from '../../../utils.js';
 
 const extensionName = 'amor';
-const VERSION = '1.10.4';
+const VERSION = '1.11.0';
 
 // ---------------- 维度常量 ----------------
 const RHYTHMS = ['平缓', '日常', '暧昧', '紧张', '冲突', '高潮', '余波'];
@@ -313,6 +313,8 @@ const PLAN_TIMEOUT_MS = 120000;
 const PLAN_INJECT_DEPTH = 1;     // 0 = 最末尾，1 = 倒数第二条之前
 const MAX_SNAPSHOTS = 20;        // 每轮规划留一份快照，用于删除/重生成/Swipe 时回滚（存在酒馆设置里，别留太多）
 const MAX_OUTCOMES = 30;
+const MAX_HISTORY = 30;          // 规划历史条数
+const HISTORY_SHOW = 12;
 const MAX_THREADS = 8;
 const MAX_ARC_DONE = 8;          // 故事大阶段：已走过的阶段最多留几个
 const MAX_ARC_NEXT = 3;
@@ -418,6 +420,7 @@ function freshPlanChat() {
         choices: null,
         snapshots: [],
         outcomes: [],
+        history: [],
         meta: { createdAt: Date.now(), updatedAt: Date.now() },
     };
 }
@@ -445,6 +448,7 @@ function normalizePlanChat(cd) {
     if (!cd.choices || typeof cd.choices !== 'object' || !Array.isArray(cd.choices.options)) cd.choices = null;
     if (!Array.isArray(cd.snapshots)) cd.snapshots = [];
     if (!Array.isArray(cd.outcomes)) cd.outcomes = [];
+    if (!Array.isArray(cd.history)) cd.history = [];
     if (typeof cd.planOverride !== 'string') cd.planOverride = '';
     if (typeof cd.lastSeenKey !== 'string') cd.lastSeenKey = '';
     if (typeof cd.roundsSincePlan !== 'number') cd.roundsSincePlan = 0;
@@ -1249,6 +1253,24 @@ function applyPlan(cd, plan, msgIndex) {
     cd.meta.updatedAt = Date.now();
 }
 
+// 最近一次失败（只存在内存里，换聊天后不显示）
+const lastFail = {};
+function recordFail(kind, detail) { lastFail[kind] = { key: currentChatKey(), text: detail, at: Date.now() }; renderOverview(); }
+function clearFail(kind) { if (lastFail[kind]) { delete lastFail[kind]; renderOverview(); } }
+
+function pushPlanHistory(cd, msgIndex, cost) {
+    const s = cd.directorState;
+    const out = cd.outcomes.filter(o => o.msgIndex === msgIndex).slice(-1)[0];
+    cd.history = cd.history.filter(h => h.msgIndex !== msgIndex);
+    cd.history.push({
+        rev: cd.revision.amorRevision, msgIndex, at: Date.now(),
+        beat: s.currentBeat, cause: s.beatCause, stage: s.arc.stage, tension: s.tension,
+        outcome: out ? out.text : '', urgent: cost.urgent || '',
+        sec: cost.sec, inChars: cost.inChars, outChars: cost.outChars,
+    });
+    if (cd.history.length > MAX_HISTORY) cd.history.splice(0, cd.history.length - MAX_HISTORY);
+}
+
 function pushPlanSnapshot(cd, msgIndex) {
     const m = chat[msgIndex];
     if (!m) return;
@@ -1353,12 +1375,14 @@ async function runChoices(focus) {
         if (!m || msgHash(m) !== hash0 || plannerChatData() !== cd) { setPlannerStatus(''); return; }
         applyChoices(cd, parsePlanJson(raw), lastIdx);
         saveSettings();
+        clearFail('choice');
         renderChoices(cd);
         setPlannerStatus('');
     } catch (e) {
         const detail = safeErrorText(e, settings.planner.api.key);
         console.warn('[Amor] 生成选项失败：', e);
         setPlannerStatus('生成选项失败：' + detail);
+        recordFail('choice', detail);
         toastr.error('生成选项失败：' + detail);
     } finally {
         choiceBusy = false;
@@ -1441,6 +1465,7 @@ async function runDoctor({ auto = false } = {}) {
             }
         }
         saveSettings();
+        clearFail('doctor');
         renderDoctor(cd);
         setPlannerStatus(auto ? '自动导演：已会诊并采纳医嘱（可在「故事医生」里撤销）' : '');
         return true;
@@ -1448,6 +1473,7 @@ async function runDoctor({ auto = false } = {}) {
         const detail = safeErrorText(e, settings.planner.api.key);
         console.warn('[Amor] 故事医生会诊失败：', e);
         setPlannerStatus('会诊失败：' + detail);
+        recordFail('doctor', detail);
         if (!auto) toastr.error('故事医生会诊失败：' + detail);
         return false;
     } finally {
@@ -1485,15 +1511,19 @@ async function runPlanner({ manual = false, urgent = '' } = {}) {
     setPlannerStatus(urgent ? '规划中（针对：' + cleanStr(urgent, 30) + '）…' : '规划中…');
     try {
         const planPrompt = buildPlanPrompt(cd, lastIdx, urgent);
-        const raw = await runExclusive(() => callPlannerLLM({ systemPrompt: PLANNER_SYSTEM, prompt: planPrompt }));
+        let t0 = 0;
+        const raw = await runExclusive(() => { t0 = Date.now(); return callPlannerLLM({ systemPrompt: PLANNER_SYSTEM, prompt: planPrompt }); });
+        const cost = { sec: Math.round((Date.now() - t0) / 100) / 10, inChars: PLANNER_SYSTEM.length + planPrompt.length, outChars: String(raw || '').length, urgent: cleanStr(urgent, 40) };
         // 等待期间聊天可能已被删除/重新生成/重置：以返回时的聊天为准，对不上就丢弃这次规划
         const m = chat[lastIdx];
         if (!m || msgHash(m) !== hash0 || plannerChatData() !== cd) { setPlannerStatus(''); return; }
         applyPlan(cd, parsePlanJson(raw), lastIdx);
         cd.revision.serendipityRevision = rev0;
         pushPlanSnapshot(cd, lastIdx);
+        pushPlanHistory(cd, lastIdx, cost);
         saveSettings();
         updatePlannerInjection();
+        clearFail('plan');
         renderPlanner();
         setPlannerStatus('');
         if (manual) toastr.success('Amor 已重新规划');
@@ -1503,6 +1533,7 @@ async function runPlanner({ manual = false, urgent = '' } = {}) {
         const detail = safeErrorText(e, settings.planner.api.key);
         console.warn('[Amor] 规划失败：', e);
         setPlannerStatus('规划失败：' + detail);
+        recordFail('plan', detail);
         if (manual) toastr.error('Amor 规划失败：' + detail);
     } finally {
         plannerBusy = false;
@@ -1555,6 +1586,7 @@ function plannerReconcile() {
     normalizePlanChat(cd);
     cd.revision.lastProcessedMessageIndex = last ? last.msgIndex : -1;
     cd.outcomes = cd.outcomes.filter(o => o.msgIndex <= cd.revision.lastProcessedMessageIndex);
+    cd.history = cd.history.filter(h => h.msgIndex <= cd.revision.lastProcessedMessageIndex);
     cd.lastSeenKey = '';
     cd.revision.amorRevision += 1;
     saveSettings();
@@ -1796,6 +1828,11 @@ function plannerPageHtml() {
         </div>
 
         <div class="amor__section">
+          <div class="amor__label">规划历史（每轮规划安排了什么、实际发生了什么；可回到某一轮重新开始）</div>
+          <div class="amor__p-history"></div>
+        </div>
+
+        <div class="amor__section">
           <div class="amor__label">规划设置</div>
           <div class="amor__p-field">
             <div class="amor__p-field-label">每几轮规划一次</div>
@@ -1829,6 +1866,31 @@ function bindPlannerEvents() {
         if (tab === 'overview') renderOverview();
     });
 
+    panel.on('click', '.amor__p-hist-back', function () {
+        const cd = plannerEnsureChat();
+        if (!cd) return;
+        const idx = Number($(this).attr('data-idx'));
+        const sn = cd.snapshots.find(x => x.msgIndex === idx);
+        const m = chat[idx];
+        if (!sn || !m || msgHash(m) !== sn.hash) { toastr.warning('这一轮的快照已经失效，无法回到'); renderPlanner(); return; }
+        if (!confirm('回到这一轮的规划状态？之后各轮的规划、历史和实际结果记录会被丢弃（聊天本身不受影响），之后的消息会在下次规划时重新评估。')) return;
+        cd.directorState = clone(sn.state);
+        normalizePlanChat(cd);
+        cd.snapshots = cd.snapshots.filter(x => x.msgIndex <= idx);
+        cd.history = cd.history.filter(h => h.msgIndex <= idx);
+        cd.outcomes = cd.outcomes.filter(o => o.msgIndex <= idx);
+        cd.revision.lastProcessedMessageIndex = idx;
+        cd.revision.amorRevision += 1;
+        cd.lastSeenKey = '';
+        cd.roundsSincePlan = 0;
+        cd.choices = null;
+        cd.doctor = null;
+        cd.meta.updatedAt = Date.now();
+        saveSettings();
+        updatePlannerInjection();
+        renderPlanner();
+        toastr.success('已回到第 ' + (cd.history.length ? cd.history[cd.history.length - 1].rev : '?') + ' 轮的规划');
+    });
     panel.on('click', '.amor__ov-save', function () {
         const key = $(this).attr('data-k');
         const text = String(panel.find(`.amor__ov-edit[data-k="${key}"]`).val() || '').trim();
@@ -2397,6 +2459,16 @@ function renderOverview() {
     const lk = settings.style ? STYLE_PRESETS.find(x => x.id === settings.style) : null;
     if (lk) bits.push('风格：' + lk.name);
     st.append($('<div class="amor__ov-val">').text(bits.join(' · ')));
+    const lh = cd.history[cd.history.length - 1];
+    if (lh && Number.isFinite(lh.sec)) st.append($('<div class="amor__p-th-meta">').text('上次规划：用时 ' + lh.sec + ' 秒，输入约 ' + lh.inChars + ' 字 / 输出约 ' + lh.outChars + ' 字'));
+    const FAIL_LABEL = { plan: '规划', doctor: '会诊', choice: '生成选项' };
+    for (const k of Object.keys(lastFail)) {
+        const f = lastFail[k];
+        if (f.key !== currentChatKey()) continue;
+        const t = new Date(f.at);
+        const hm = String(t.getHours()).padStart(2, '0') + ':' + String(t.getMinutes()).padStart(2, '0');
+        st.append($('<div class="amor__p-warn">').css('margin-top', '10px').text('上次' + FAIL_LABEL[k] + '失败（' + hm + '）：' + f.text + '。剧情生成不受影响，沿用上一份规划。'));
+    }
 
     if (!s.currentBeat && !sc.objective && !sc.situation && !s.arc.stage) {
         box.append($('<div class="amor__p-empty">').text(p.enabled ? '还没有规划。聊几轮后会自动出现，也可以到「剧情规划」页点「立即规划」。' : '剧情规划还没开启。到「剧情规划」页打开后，这里会显示当前剧情的全貌。'));
@@ -2449,6 +2521,34 @@ function renderOverview() {
     if (pend.length) item(sec('待办'), '', pend.join(' · '));
 }
 
+function renderHistory(cd) {
+    const box = $('#st-amor .amor__p-history').empty();
+    if (!cd || !cd.history.length) {
+        box.append($('<div class="amor__p-empty">').text(cd ? '还没有记录。规划几轮后，这里会列出每一轮。' : '请先打开一个聊天。'));
+        return;
+    }
+    const snaps = new Set(cd.snapshots.map(sn => sn.msgIndex));
+    const lastProc = cd.revision.lastProcessedMessageIndex;
+    for (const h of cd.history.slice(-HISTORY_SHOW).reverse()) {
+        const row = $('<div class="amor__p-thread amor__p-hcard">');
+        row.append($('<div class="amor__p-th-row">').append(
+            $('<span class="amor__p-hno">').text('第 ' + h.rev + ' 轮'),
+            $('<span class="amor__p-th-unit">').text((h.stage ? h.stage + ' · ' : '') + '张力 ' + h.tension)));
+        row.append($('<div class="amor__ov-val">').text('安排：' + (h.beat || '（无）') + (h.cause ? '（起因：' + h.cause + '）' : '')));
+        row.append($('<div class="amor__ov-val">').text('实际：' + (h.outcome || '（本轮没有记录到变化）')));
+        const meta = [];
+        if (Number.isFinite(h.sec)) meta.push('用时 ' + h.sec + ' 秒');
+        if (Number.isFinite(h.inChars)) meta.push('输入约 ' + h.inChars + ' 字 / 输出约 ' + h.outChars + ' 字');
+        if (h.urgent) meta.push('针对：' + h.urgent);
+        if (meta.length) row.append($('<div class="amor__p-th-meta">').text(meta.join(' · ')));
+        if (snaps.has(h.msgIndex) && h.msgIndex !== lastProc) {
+            row.append($('<div class="amor__p-rx-btns">').append(
+                $('<button type="button" class="amor__p-reset amor__p-hist-back">').attr('data-idx', h.msgIndex).text('回到这一轮')));
+        }
+        box.append(row);
+    }
+}
+
 function renderStoryArc(cd) {
     const box = $('#st-amor .amor__p-arcchain').empty();
     const a = cd && cd.directorState.arc;
@@ -2478,6 +2578,7 @@ function renderPlanner() {
     const cd = currentChatKey() ? (plannerChatData() || freshPlanChat()) : null;
     renderOverview();
     if (!cd) {
+        renderHistory(null);
         renderStoryArc(null);
         renderThreads(null);
         renderArcs(null);
@@ -2493,6 +2594,7 @@ function renderPlanner() {
         return;
     }
     const s = cd.directorState;
+    renderHistory(cd);
     renderStoryArc(cd);
     renderThreads(cd);
     renderArcs(cd);

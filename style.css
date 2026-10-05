@@ -449,6 +449,9 @@
 #st-amor .amor__ov-edit { margin-top: 8px; font-size: 12px; }
 #st-amor .amor__ov-pv .amor__p-rx-btns { margin-top: 8px; }
 
+#st-amor .amor__p-hno { font-weight: 600; font-size: 13px; }
+#st-amor .amor__p-hcard .amor__ov-val { font-size: 13px; }
+
 /* 移动端 */
 @media (max-width: 480px) {
     #st-amor .amor__body { padding: 16px 14px 40px; }
