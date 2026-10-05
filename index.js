@@ -17,7 +17,7 @@ import { selected_group } from '../../../group-chats.js';
 import { getStringHash } from '../../../utils.js';
 
 const extensionName = 'amor';
-const VERSION = '1.14.1';
+const VERSION = '1.14.3';
 
 // ---------------- 维度常量 ----------------
 const RHYTHMS = ['平缓', '日常', '暧昧', '紧张', '冲突', '高潮', '余波'];
@@ -62,6 +62,7 @@ function freshSettings() {
     return {
         enabled: false,
         nsfw: false,           // 一键 NSFW：独立于导演模式，开启后注入成人向描写许可
+        nsfwPrompt: '',        // 手动改写的 NSFW 提示词，空 = 用默认
         rhythm: '',            // RHYTHMS 之一，空 = 不指定
         camera: '',            // CAMERAS 之一，空 = 不指定
         focus: { psy: 5, env: 3, dialog: 5, action: 5 },  // 0-10
@@ -105,6 +106,7 @@ function loadSettings() {
     s.initiative = Object.assign({}, def.initiative, (s.initiative && typeof s.initiative === 'object') ? s.initiative : {});
     if (typeof s.enabled !== 'boolean') s.enabled = !!s.enabled;
     if (typeof s.nsfw !== 'boolean') s.nsfw = false;
+    if (typeof s.nsfwPrompt !== 'string') s.nsfwPrompt = '';
     if (typeof s.rhythm !== 'string') s.rhythm = '';
     if (typeof s.camera !== 'string') s.camera = '';
     if (typeof s.custom !== 'string') s.custom = '';
@@ -180,19 +182,19 @@ function buildDirectorPromptAuto() {
     return lines.join('\n');
 }
 
-function buildNsfwPrompt() {
-    if (!settings.nsfw) return '';
-    return [
-        '[Amor NSFW 模式]',
-        '当剧情自然发展到亲密或情色场景时，允许并鼓励直接、细腻地描写，不要回避、淡化、跳过，也不要用省略或转场一笔带过。',
-        '· 描写要符合角色的性格、当前关系与已有设定，循序渐进，重视感官、情绪与双方的互动。',
-        '· 所有涉及的角色均为成年人，场景建立在双方愿意的前提下。',
-        '· 不替用户角色做决定，也不代写用户角色的台词与动作，把选择留给用户。',
-    ].join('\n');
-}
+const NSFW_DEFAULT = [
+    '[Amor NSFW 模式]',
+    '当剧情自然发展到亲密或情色场景时，允许并鼓励直接、细腻地描写，不要回避、淡化、跳过，也不要用省略或转场一笔带过。',
+    '· 描写要符合角色的性格、当前关系与已有设定，循序渐进，重视感官、情绪与双方的互动。',
+    '· 所有涉及的角色均为成年人，场景建立在双方愿意的前提下。',
+    '· 不替用户角色做决定，也不代写用户角色的台词与动作，把选择留给用户。',
+].join('\n');
+function nsfwText() { return (settings.nsfwPrompt || '').trim() || NSFW_DEFAULT; }
+function buildNsfwPrompt() { return settings.nsfw ? nsfwText() : ''; }
 
 function updatePromptInjection() {
-    setExtensionPrompt('amor_nsfw', buildNsfwPrompt(), extension_prompt_types.BEFORE_PROMPT, 0);
+    // 放在聊天记录靠近末尾处（深度 1），比放在提示词最前面更不容易被角色设定和历史淹没
+    setExtensionPrompt('amor_nsfw', buildNsfwPrompt(), extension_prompt_types.IN_CHAT, 1);
     setExtensionPrompt(
         'amor_director',
         buildDirectorPrompt(),
@@ -1772,7 +1774,7 @@ function plannerPageHtml() {
         <div class="amor__auto-ctl">
           <div class="amor__auto-ctl-row">
             <button type="button" class="amor__direct-now amor__p-plan">立即规划</button>
-            <button type="button" class="amor__p-reset">重置本聊天规划</button>
+            <button type="button" class="amor__p-reset amor__p-reset-chat">重置本聊天规划</button>
           </div>
           <div class="amor__auto-ctl-row">
             <span class="amor__link-status amor__p-link"></span>
@@ -1986,7 +1988,12 @@ function bindPlannerEvents() {
     panel.on('click', '.amor__ov-save', function () {
         const key = $(this).attr('data-k');
         const text = String(panel.find(`.amor__ov-edit[data-k="${key}"]`).val() || '').trim();
-        if (key === 'dir') {
+        if (key === 'nsfw') {
+            settings.nsfwPrompt = (text && text !== NSFW_DEFAULT) ? text : '';
+            saveSettings();
+            updatePromptInjection();
+            renderNsfw();
+        } else if (key === 'dir') {
             settings.dirOverride = (text && text !== buildDirectorPromptAuto().trim()) ? text : '';
             settings.dirOverrideBase = settings.dirOverride ? JSON.stringify(snapshotDirector()) : '';
             saveSettings();
@@ -2005,7 +2012,12 @@ function bindPlannerEvents() {
     });
     panel.on('click', '.amor__ov-restore', function () {
         const key = $(this).attr('data-k');
-        if (key === 'dir') {
+        if (key === 'nsfw') {
+            settings.nsfwPrompt = '';
+            saveSettings();
+            updatePromptInjection();
+            renderNsfw();
+        } else if (key === 'dir') {
             settings.dirOverride = '';
             settings.dirOverrideBase = '';
             saveSettings();
@@ -2034,7 +2046,7 @@ function bindPlannerEvents() {
         updatePlannerInjection();
     });
     panel.on('click', '.amor__p-plan', () => runPlanner({ manual: true }));
-    panel.on('click', '.amor__p-reset', () => {
+    panel.on('click', '.amor__p-reset-chat', () => {
         if (!confirm('重置后，本聊天的规划状态和结果记录会清空（Serendipity 的数据不受影响）。继续吗？')) return;
         const key = currentChatKey();
         if (!key) return;
@@ -2550,6 +2562,7 @@ function renderOverview() {
     const dirAuto = buildDirectorPromptAuto();
     preview('dir', '导演台指令', settings.enabled, dirOv, dirAuto, settings.enabled ? buildDirectorPrompt() : '', '导演台未开启，不会注入；开启后才生效。',
         (dirOv && settings.dirOverrideBase && settings.dirOverrideBase !== JSON.stringify(snapshotDirector())) ? '你保存这份手写版本之后，导演台的设置（节奏 / 镜头 / 重点 / 风格等）又改过，现在的手写版本不会反映这些改动。可以看看自动版，需要的话点「恢复自动生成」。' : '');
+    preview('nsfw', 'NSFW 提示词', settings.nsfw, !!(settings.nsfwPrompt || '').trim(), NSFW_DEFAULT, settings.nsfw ? nsfwText() : '', 'NSFW 未开启，不会发送；在「导演台」顶部打开。', '');
     const planAuto = (() => { try { return buildPlanBlock(s, cd); } catch (e) { return ''; } })();
     const planActive = p.enabled && p.mode !== 'manual';
     preview('plan', '剧情规划指令', planActive, planOv, planAuto, planActive ? currentPlanInjection() : '', p.enabled ? '手动模式只分析，不注入。' : '剧情规划未开启，不会注入。',
@@ -2774,7 +2787,16 @@ function buildPanel() {
         </div>
         <div class="amor__auto-ctl amor__nsfw-box">
           <label class="amor__auto-ctl-row"><span class="amor__switch"><input type="checkbox" class="amor__nsfw"><span class="amor__switch-slider"></span></span><span class="amor__master-label">NSFW 一键开启</span></label>
-          <div class="amor__hint">独立开关，不需要先开导演模式。开启后每次生成都会附上一段成人向描写许可（仅限成年角色、双方愿意、不替用户角色决定）。</div>
+          <div class="amor__hint">独立开关，不需要先开导演模式。开启后每次生成都会把下面这段提示词放在聊天记录靠近末尾处发给模型。</div>
+          <div class="amor__nsfw-state amor__p-th-meta"></div>
+          <details class="amor__ov-pv amor__nsfw-pv">
+            <summary>查看 / 修改提示词</summary>
+            <textarea class="amor__p-text amor__nsfw-text" spellcheck="false" rows="8"></textarea>
+            <div class="amor__p-rx-btns">
+              <button type="button" class="amor__direct-now amor__nsfw-save">保存修改</button>
+              <button type="button" class="amor__p-reset amor__nsfw-restore">恢复默认</button>
+            </div>
+          </details>
         </div>
         <div class="amor__auto-note" style="display:none">
           <div class="amor__auto-note-head">AI 导演指令</div>
@@ -2854,6 +2876,7 @@ function renderPanel() {
     renderPlanner();
     panel.find('.amor__enabled').prop('checked', settings.enabled);
     panel.find('.amor__nsfw').prop('checked', settings.nsfw);
+    renderNsfw();
     panel.find('.amor__auto').prop('checked', settings.autoDirector);
     panel.toggleClass('amor__on', settings.enabled);
 
@@ -2911,6 +2934,15 @@ function renderPanel() {
     renderPresets();
 }
 
+function renderNsfw() {
+    const panel = $('#st-amor');
+    panel.find('.amor__nsfw-state').text(settings.nsfw
+        ? '当前：已开启（' + nsfwText().length + ' 字）' + ((settings.nsfwPrompt || '').trim() ? ' · 使用你改过的版本' : '')
+        : '当前：未开启，不会发送。');
+    const ta = panel.find('.amor__nsfw-text');
+    if (!ta.is(':focus')) ta.val(nsfwText());
+}
+
 function renderPresets() {
     const el = $('#st-amor .amor__presets');
     if (!el.length) return;
@@ -2936,6 +2968,7 @@ function buildExport() {
         settings: Object.assign(snapshotDirector(), {
             dirOverride: settings.dirOverride,
             nsfw: settings.nsfw,
+            nsfwPrompt: settings.nsfwPrompt,
             presets: clone(settings.presets),
             planner: { enabled: p.enabled, mode: p.mode, everyN: p.everyN, urgentReplan: p.urgentReplan, tokenBudget: p.tokenBudget },
         }),
@@ -2965,6 +2998,7 @@ function applyImportedSettings(src) {
     const init = {};
     for (const r of INITIATIVE_ROLES) init[r.key] = INIT_LEVELS.includes(src.initiative && src.initiative[r.key]) ? src.initiative[r.key] : def.initiative[r.key];
     if (typeof src.nsfw === 'boolean') keep.nsfw = src.nsfw;
+    if (typeof src.nsfwPrompt === 'string') keep.nsfwPrompt = src.nsfwPrompt.slice(0, 4000);
     Object.assign(settings, keep, { focus, initiative: init });
     settings.dirOverrideBase = keep.dirOverride ? JSON.stringify(snapshotDirector()) : '';
     if (Array.isArray(src.presets)) {
@@ -3024,10 +3058,25 @@ function bindPanelEvents() {
         syncAutoRefreshTimer();
     });
 
+    panel.on('click', '.amor__nsfw-save', function () {
+        const t = String(panel.find('.amor__nsfw-text').val() || '').trim();
+        settings.nsfwPrompt = (t && t !== NSFW_DEFAULT) ? t : '';
+        saveSettings(); updatePromptInjection();
+        panel.find('.amor__nsfw-text').blur();
+        renderNsfw(); renderOverview();
+        toastr.success('已保存');
+    });
+    panel.on('click', '.amor__nsfw-restore', function () {
+        settings.nsfwPrompt = '';
+        saveSettings(); updatePromptInjection();
+        panel.find('.amor__nsfw-text').blur();
+        renderNsfw(); renderOverview();
+    });
     panel.on('change', '.amor__nsfw', function () {
         settings.nsfw = this.checked;
         saveSettings();
         updatePromptInjection();
+        renderNsfw(); renderOverview();
         toastr.info(settings.nsfw ? 'NSFW 已开启' : 'NSFW 已关闭');
     });
 
