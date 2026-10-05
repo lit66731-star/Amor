@@ -457,6 +457,9 @@
 
 #st-amor .amor__p-pctbox { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; }
 
+#st-amor .amor__nsfw-box { margin-top: -8px; }
+#st-amor .amor__nsfw-box .amor__hint { margin-top: 8px; }
+
 /* 移动端 */
 @media (max-width: 480px) {
     #st-amor .amor__body { padding: 16px 14px 40px; }

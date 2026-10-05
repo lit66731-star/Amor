@@ -17,7 +17,7 @@ import { selected_group } from '../../../group-chats.js';
 import { getStringHash } from '../../../utils.js';
 
 const extensionName = 'amor';
-const VERSION = '1.13.0';
+const VERSION = '1.14.0';
 
 // ---------------- 维度常量 ----------------
 const RHYTHMS = ['平缓', '日常', '暧昧', '紧张', '冲突', '高潮', '余波'];
@@ -61,6 +61,7 @@ const STYLE_PRESETS = [
 function freshSettings() {
     return {
         enabled: false,
+        nsfw: false,           // 一键 NSFW：独立于导演模式，开启后注入成人向描写许可
         rhythm: '',            // RHYTHMS 之一，空 = 不指定
         camera: '',            // CAMERAS 之一，空 = 不指定
         focus: { psy: 5, env: 3, dialog: 5, action: 5 },  // 0-10
@@ -103,6 +104,7 @@ function loadSettings() {
     s.focus = Object.assign({}, def.focus, (s.focus && typeof s.focus === 'object') ? s.focus : {});
     s.initiative = Object.assign({}, def.initiative, (s.initiative && typeof s.initiative === 'object') ? s.initiative : {});
     if (typeof s.enabled !== 'boolean') s.enabled = !!s.enabled;
+    if (typeof s.nsfw !== 'boolean') s.nsfw = false;
     if (typeof s.rhythm !== 'string') s.rhythm = '';
     if (typeof s.camera !== 'string') s.camera = '';
     if (typeof s.custom !== 'string') s.custom = '';
@@ -178,7 +180,19 @@ function buildDirectorPromptAuto() {
     return lines.join('\n');
 }
 
+function buildNsfwPrompt() {
+    if (!settings.nsfw) return '';
+    return [
+        '[Amor NSFW 模式]',
+        '当剧情自然发展到亲密或情色场景时，允许并鼓励直接、细腻地描写，不要回避、淡化、跳过，也不要用省略或转场一笔带过。',
+        '· 描写要符合角色的性格、当前关系与已有设定，循序渐进，重视感官、情绪与双方的互动。',
+        '· 所有涉及的角色均为成年人，场景建立在双方愿意的前提下。',
+        '· 不替用户角色做决定，也不代写用户角色的台词与动作，把选择留给用户。',
+    ].join('\n');
+}
+
 function updatePromptInjection() {
+    setExtensionPrompt('amor_nsfw', buildNsfwPrompt(), extension_prompt_types.BEFORE_PROMPT, 0);
     setExtensionPrompt(
         'amor_director',
         buildDirectorPrompt(),
@@ -2758,6 +2772,10 @@ function buildPanel() {
           <label class="amor__switch"><input type="checkbox" class="amor__auto"><span class="amor__switch-slider"></span></label>
           <span class="amor__master-label">自动导演</span>
         </div>
+        <div class="amor__auto-ctl amor__nsfw-box">
+          <label class="amor__auto-ctl-row"><span class="amor__switch"><input type="checkbox" class="amor__nsfw"><span class="amor__switch-slider"></span></span><span class="amor__master-label">NSFW 一键开启</span></label>
+          <div class="amor__hint">独立开关，不需要先开导演模式。开启后每次生成都会附上一段成人向描写许可（仅限成年角色、双方愿意、不替用户角色决定）。</div>
+        </div>
         <div class="amor__auto-note" style="display:none">
           <div class="amor__auto-note-head">AI 导演指令</div>
           <div class="amor__auto-note-body"></div>
@@ -2835,6 +2853,7 @@ function renderPanel() {
     if (!panel.length) return;
     renderPlanner();
     panel.find('.amor__enabled').prop('checked', settings.enabled);
+    panel.find('.amor__nsfw').prop('checked', settings.nsfw);
     panel.find('.amor__auto').prop('checked', settings.autoDirector);
     panel.toggleClass('amor__on', settings.enabled);
 
@@ -2916,6 +2935,7 @@ function buildExport() {
         app: EXPORT_APP, format: EXPORT_FORMAT, version: VERSION, exportedAt: Date.now(),
         settings: Object.assign(snapshotDirector(), {
             dirOverride: settings.dirOverride,
+            nsfw: settings.nsfw,
             presets: clone(settings.presets),
             planner: { enabled: p.enabled, mode: p.mode, everyN: p.everyN, urgentReplan: p.urgentReplan, tokenBudget: p.tokenBudget },
         }),
@@ -2944,6 +2964,7 @@ function applyImportedSettings(src) {
     for (const f of FOCUS_KEYS) focus[f.key] = Number.isFinite(src.focus && src.focus[f.key]) ? Math.max(0, Math.min(10, src.focus[f.key])) : def.focus[f.key];
     const init = {};
     for (const r of INITIATIVE_ROLES) init[r.key] = INIT_LEVELS.includes(src.initiative && src.initiative[r.key]) ? src.initiative[r.key] : def.initiative[r.key];
+    if (typeof src.nsfw === 'boolean') keep.nsfw = src.nsfw;
     Object.assign(settings, keep, { focus, initiative: init });
     settings.dirOverrideBase = keep.dirOverride ? JSON.stringify(snapshotDirector()) : '';
     if (Array.isArray(src.presets)) {
@@ -3001,6 +3022,13 @@ function bindPanelEvents() {
         panel.toggleClass('amor__on', settings.enabled);
         renderPanel();
         syncAutoRefreshTimer();
+    });
+
+    panel.on('change', '.amor__nsfw', function () {
+        settings.nsfw = this.checked;
+        saveSettings();
+        updatePromptInjection();
+        toastr.info(settings.nsfw ? 'NSFW 已开启' : 'NSFW 已关闭');
     });
 
     // 自动导演开关
