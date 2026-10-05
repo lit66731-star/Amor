@@ -17,7 +17,7 @@ import { selected_group } from '../../../group-chats.js';
 import { getStringHash } from '../../../utils.js';
 
 const extensionName = 'amor';
-const VERSION = '1.12.0';
+const VERSION = '1.13.0';
 
 // ---------------- 维度常量 ----------------
 const RHYTHMS = ['平缓', '日常', '暧昧', '紧张', '冲突', '高潮', '余波'];
@@ -69,6 +69,7 @@ function freshSettings() {
         custom: '',            // 自定义导演指令
         style: '',             // 内置风格 id（STYLE_PRESETS），空 = 无
         dirOverride: '',       // 手动覆盖导演指令全文，空 = 自动生成
+        dirOverrideBase: '',   // 保存覆盖时的导演台旋钮快照，用来判断自动版是否已变
         autoDirector: false,   // 自动导演模式（每轮生成后 AI 分析并调整旋钮）
         autoNote: '',          // AI 自动生成的导演指令
         lastAnalysisAt: 0,     // 上次自动分析时间戳
@@ -106,6 +107,7 @@ function loadSettings() {
     if (typeof s.camera !== 'string') s.camera = '';
     if (typeof s.custom !== 'string') s.custom = '';
     if (typeof s.dirOverride !== 'string') s.dirOverride = '';
+    if (typeof s.dirOverrideBase !== 'string') s.dirOverrideBase = '';
     if (typeof s.style !== 'string' || !STYLE_PRESETS.some(x => x.id === s.style)) s.style = '';
     if (s.pacing == null) s.pacing = def.pacing;
     if (typeof s.autoDirector !== 'boolean') s.autoDirector = !!s.autoDirector;
@@ -313,6 +315,7 @@ const PLAN_TIMEOUT_MS = 120000;
 const PLAN_INJECT_DEPTH = 1;     // 0 = 最末尾，1 = 倒数第二条之前
 const MAX_SNAPSHOTS = 20;        // 每轮规划留一份快照，用于删除/重生成/Swipe 时回滚（存在酒馆设置里，别留太多）
 const MAX_OUTCOMES = 30;
+const OVERRIDE_STALE_ROUNDS = 3;   // 手动覆盖的规划指令，规划往前走了这么多轮后提醒
 const MAX_HISTORY = 30;          // 规划历史条数
 const HISTORY_SHOW = 12;
 const MAX_THREADS = 8;
@@ -450,6 +453,7 @@ function normalizePlanChat(cd) {
     if (!Array.isArray(cd.outcomes)) cd.outcomes = [];
     if (!Array.isArray(cd.history)) cd.history = [];
     if (typeof cd.planOverride !== 'string') cd.planOverride = '';
+    if (!Number.isFinite(cd.planOverrideRev)) cd.planOverrideRev = -1;
     if (typeof cd.lastSeenKey !== 'string') cd.lastSeenKey = '';
     if (typeof cd.roundsSincePlan !== 'number') cd.roundsSincePlan = 0;
     if (typeof cd.lastUrgentRev !== 'number') cd.lastUrgentRev = -99;
@@ -766,12 +770,17 @@ function mergeThreads(cd, s, list) {
 }
 function threadsForPrompt(cd, s) {
     if (!s.threads.length) return '';
-    return s.threads.map(t => {
+    // 已完结的折成一行（不再需要规划），暂停的去掉冗余字段，进行中的才给完整信息
+    const done = s.threads.filter(t => t.status === 'resolved');
+    const rows = s.threads.filter(t => t.status !== 'resolved').map(t => {
+        if (t.status === 'paused') return `- id=${t.id} | ${t.title} | ${THREAD_STATUS[t.status]} | 进度${t.progress}%`;
         const idle = threadIdle(cd, t);
         return `- id=${t.id} | ${t.title} | ${THREAD_KINDS[t.kind]} | ${THREAD_STATUS[t.status]} | 重要度${THREAD_IMPORTANCE[t.importance]} | 进度${t.progress}%` +
             (t.characters ? ' | 人物：' + t.characters : '') +
             (t.status === 'active' ? (idle >= THREAD_IDLE_WARN && t.importance !== 'low' ? ` | 已${idle}次规划没有推进（需要优先考虑）` : (idle ? ` | ${idle}次规划前推进过` : ' | 刚推进过')) : '');
-    }).join('\n');
+    });
+    if (done.length) rows.push('- 已完结（无需再规划）：' + done.map(t => t.title).join('、'));
+    return rows.join('\n');
 }
 
 // ---- 情绪弧线（Emotional Arc）：关注情绪「为什么变化」，不记数值 ----
@@ -962,12 +971,17 @@ function foreshadowsForPrompt(cd, s) {
     if (!live) return '';
     const rows = s.foreshadowPlan.filter(p => live.has(String(p.id)));
     if (!rows.length) return '';
-    return rows.map(p => {
+    // 还没有任何安排的潜伏伏笔折成一行，其余才给完整信息
+    const quiet = rows.filter(p => p.stage === 'sleep' && !p.hints && !p.nextHint && !p.revealWhen);
+    const active = rows.filter(p => !quiet.includes(p));
+    const lines = active.map(p => {
         const x = live.get(String(p.id));
         return `- id=${p.id} | ${p.title} | 状态：${x.status}` + (x.day != null ? ` | 第${x.day}天埋下` : '') + (x.note ? ' | 备注：' + cleanStr(x.note, 60) : '') +
             ` | 你的安排：${FORE_STAGE[p.stage]}` + (p.hints ? ` | 已带出${p.hints}次，最近一次在${foreIdle(cd, p)}次规划前` : ' | 还没有带出过') +
             (p.nextHint ? ' | 铺垫思路：' + p.nextHint : '') + (p.revealWhen ? ' | 回收条件：' + p.revealWhen : '');
-    }).join('\n');
+    });
+    if (quiet.length) lines.push('- 潜伏中、暂无安排（需要时仍可按 id 安排）：' + quiet.map(p => `id=${p.id}《${p.title}》`).join('、'));
+    return lines.join('\n');
 }
 
 // ---- 故事巡检（Story Inspector）：纯规则，不调用模型；只指出问题，不修改任何数据 ----
@@ -1960,12 +1974,14 @@ function bindPlannerEvents() {
         const text = String(panel.find(`.amor__ov-edit[data-k="${key}"]`).val() || '').trim();
         if (key === 'dir') {
             settings.dirOverride = (text && text !== buildDirectorPromptAuto().trim()) ? text : '';
+            settings.dirOverrideBase = settings.dirOverride ? JSON.stringify(snapshotDirector()) : '';
             saveSettings();
             updatePromptInjection();
         } else {
             const cd = plannerEnsureChat();
             if (!cd) { toastr.warning('请先打开一个聊天'); return; }
             cd.planOverride = (text && text !== buildPlanBlock(cd.directorState, cd).trim()) ? text : '';
+            cd.planOverrideRev = cd.planOverride ? cd.revision.amorRevision : -1;
             saveSettings();
             updatePlannerInjection();
         }
@@ -1977,12 +1993,14 @@ function bindPlannerEvents() {
         const key = $(this).attr('data-k');
         if (key === 'dir') {
             settings.dirOverride = '';
+            settings.dirOverrideBase = '';
             saveSettings();
             updatePromptInjection();
         } else {
             const cd = plannerEnsureChat();
             if (!cd) return;
             cd.planOverride = '';
+            cd.planOverrideRev = -1;
             saveSettings();
             updatePlannerInjection();
         }
@@ -2464,8 +2482,9 @@ function renderThreads(cd) {
         row.append($('<input type="text" class="amor__p-th amor__p-th-title" data-f="title" maxlength="40" spellcheck="false">').val(t.title));
         row.append($('<div class="amor__p-th-row">').append(
             sel('kind', THREAD_KINDS, t.kind), sel('status', THREAD_STATUS, t.status), sel('importance', THREAD_IMPORTANCE, t.importance),
-            $('<input type="number" class="amor__p-th amor__p-th-pct" data-f="progress" min="0" max="100">').val(t.progress),
-            $('<span class="amor__p-th-unit">%</span>'),
+            $('<span class="amor__p-pctbox">').append(
+                $('<input type="number" class="amor__p-th amor__p-th-pct" data-f="progress" min="0" max="100">').val(t.progress),
+                $('<span class="amor__p-th-unit">%</span>')),
             $('<button type="button" class="amor__p-th-del" title="删除">×</button>')));
         if (meta) row.append($('<div class="amor__p-th-meta">').text(meta + (t.characters ? ' · ' + t.characters : '')));
         else if (t.characters) row.append($('<div class="amor__p-th-meta">').text(t.characters));
@@ -2495,10 +2514,16 @@ function renderOverview() {
     const pv = sec('当前注入内容（下一条回复实际会收到的 Amor 指令，可直接修改）');
     const dirOv = !!(settings.dirOverride || '').trim();
     const planOv = !!(cd.planOverride || '').trim();
-    const preview = (key, title, active, ov, autoText, effText, offNote) => {
+    const preview = (key, title, active, ov, autoText, effText, offNote, staleNote) => {
         const d = $('<details class="amor__ov-pv">').attr('data-k', key).prop('open', openKeys.includes(key));
-        d.append($('<summary>').text(title + (active ? '（' + effText.length + ' 字）' : '（未注入）') + (ov ? ' · 已手动覆盖' : '')));
+        d.append($('<summary>').text(title + (active ? '（' + effText.length + ' 字）' : '（未注入）') + (ov ? ' · 已手动覆盖' : '') + (ov && staleNote ? ' · 可能已过期' : '')));
         if (!active) d.append($('<div class="amor__p-empty">').text(offNote));
+        if (ov && staleNote) {
+            const av = $('<details class="amor__ov-auto">').attr('data-k', key + '-auto').prop('open', openKeys.includes(key + '-auto'));
+            av.append($('<summary>').text('看看当前的自动版'));
+            av.append($('<pre class="amor__ov-pre">').text(autoText || '（自动版目前为空）'));
+            d.append($('<div class="amor__p-warn">').text(staleNote), av);
+        }
         d.append($('<textarea class="amor__p-text amor__ov-edit" spellcheck="false" rows="8">').attr('data-k', key).val(effText || autoText));
         d.append($('<div class="amor__p-rx-btns">').append(
             $('<button type="button" class="amor__direct-now amor__ov-save">').attr('data-k', key).text('保存修改'),
@@ -2509,10 +2534,12 @@ function renderOverview() {
         pv.append(d);
     };
     const dirAuto = buildDirectorPromptAuto();
-    preview('dir', '导演台指令', settings.enabled, dirOv, dirAuto, settings.enabled ? buildDirectorPrompt() : '', '导演台未开启，不会注入；开启后才生效。');
+    preview('dir', '导演台指令', settings.enabled, dirOv, dirAuto, settings.enabled ? buildDirectorPrompt() : '', '导演台未开启，不会注入；开启后才生效。',
+        (dirOv && settings.dirOverrideBase && settings.dirOverrideBase !== JSON.stringify(snapshotDirector())) ? '你保存这份手写版本之后，导演台的设置（节奏 / 镜头 / 重点 / 风格等）又改过，现在的手写版本不会反映这些改动。可以看看自动版，需要的话点「恢复自动生成」。' : '');
     const planAuto = (() => { try { return buildPlanBlock(s, cd); } catch (e) { return ''; } })();
     const planActive = p.enabled && p.mode !== 'manual';
-    preview('plan', '剧情规划指令', planActive, planOv, planAuto, planActive ? currentPlanInjection() : '', p.enabled ? '手动模式只分析，不注入。' : '剧情规划未开启，不会注入。');
+    preview('plan', '剧情规划指令', planActive, planOv, planAuto, planActive ? currentPlanInjection() : '', p.enabled ? '手动模式只分析，不注入。' : '剧情规划未开启，不会注入。',
+        (planOv && cd.planOverrideRev >= 0 && cd.revision.amorRevision - cd.planOverrideRev >= OVERRIDE_STALE_ROUNDS) ? '你的版本是 ' + (cd.revision.amorRevision - cd.planOverrideRev) + ' 轮前写的，之后规划已经往前走了，现在的手写内容可能和剧情对不上。要不要看看自动版？' : '');
 
     const st = sec('运行状态');
     const bits = [
@@ -2918,6 +2945,7 @@ function applyImportedSettings(src) {
     const init = {};
     for (const r of INITIATIVE_ROLES) init[r.key] = INIT_LEVELS.includes(src.initiative && src.initiative[r.key]) ? src.initiative[r.key] : def.initiative[r.key];
     Object.assign(settings, keep, { focus, initiative: init });
+    settings.dirOverrideBase = keep.dirOverride ? JSON.stringify(snapshotDirector()) : '';
     if (Array.isArray(src.presets)) {
         const names = new Set(settings.presets.map(x => x.name));
         for (const pr of src.presets) {
