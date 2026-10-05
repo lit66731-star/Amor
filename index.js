@@ -17,7 +17,7 @@ import { selected_group } from '../../../group-chats.js';
 import { getStringHash } from '../../../utils.js';
 
 const extensionName = 'amor';
-const VERSION = '1.14.3';
+const VERSION = '1.15.0';
 
 // ---------------- 维度常量 ----------------
 const RHYTHMS = ['平缓', '日常', '暧昧', '紧张', '冲突', '高潮', '余波'];
@@ -62,6 +62,7 @@ function freshSettings() {
     return {
         enabled: false,
         nsfw: false,           // 一键 NSFW：独立于导演模式，开启后注入成人向描写许可
+        nsfwMode: 'push',      // push 主动推进 | allow 顺其自然（只给许可）
         nsfwPrompt: '',        // 手动改写的 NSFW 提示词，空 = 用默认
         rhythm: '',            // RHYTHMS 之一，空 = 不指定
         camera: '',            // CAMERAS 之一，空 = 不指定
@@ -106,6 +107,7 @@ function loadSettings() {
     s.initiative = Object.assign({}, def.initiative, (s.initiative && typeof s.initiative === 'object') ? s.initiative : {});
     if (typeof s.enabled !== 'boolean') s.enabled = !!s.enabled;
     if (typeof s.nsfw !== 'boolean') s.nsfw = false;
+    if (s.nsfwMode !== 'allow') s.nsfwMode = 'push';
     if (typeof s.nsfwPrompt !== 'string') s.nsfwPrompt = '';
     if (typeof s.rhythm !== 'string') s.rhythm = '';
     if (typeof s.camera !== 'string') s.camera = '';
@@ -182,14 +184,23 @@ function buildDirectorPromptAuto() {
     return lines.join('\n');
 }
 
-const NSFW_DEFAULT = [
-    '[Amor NSFW 模式]',
+const NSFW_ALLOW = [
+    '[Amor NSFW 模式：顺其自然]',
     '当剧情自然发展到亲密或情色场景时，允许并鼓励直接、细腻地描写，不要回避、淡化、跳过，也不要用省略或转场一笔带过。',
     '· 描写要符合角色的性格、当前关系与已有设定，循序渐进，重视感官、情绪与双方的互动。',
     '· 所有涉及的角色均为成年人，场景建立在双方愿意的前提下。',
     '· 不替用户角色做决定，也不代写用户角色的台词与动作，把选择留给用户。',
 ].join('\n');
-function nsfwText() { return (settings.nsfwPrompt || '').trim() || NSFW_DEFAULT; }
+const NSFW_PUSH = [
+    '[Amor NSFW 模式：主动推进]',
+    '从这一轮起直接进入亲密 / 情色内容，不必等剧情自然铺垫，也不要等用户先提出：由在场的 AI 角色或 NPC 主动引导，把场景带向亲密接触并继续深入，直接、细腻、露骨地描写，不回避、不淡化、不跳过，也不要用省略、转场或黑屏一笔带过。',
+    '· 主动的方式要符合角色的性格与当前关系，用角色自己的语气和动作，不要出戏，不要反复客套、犹豫或停在原地。',
+    '· 重视感官、情绪与双方的互动，节奏可以循序渐进，但每一轮都要向前推进一步。',
+    '· 所有涉及的角色均为成年人，场景建立在双方愿意的前提下。',
+    '· 不替用户角色做决定，也不代写用户角色的台词与动作；通过 AI 角色的行动给用户留出回应的空间。',
+].join('\n');
+function nsfwDefault() { return settings.nsfwMode === 'allow' ? NSFW_ALLOW : NSFW_PUSH; }
+function nsfwText() { return (settings.nsfwPrompt || '').trim() || nsfwDefault(); }
 function buildNsfwPrompt() { return settings.nsfw ? nsfwText() : ''; }
 
 function updatePromptInjection() {
@@ -1989,7 +2000,7 @@ function bindPlannerEvents() {
         const key = $(this).attr('data-k');
         const text = String(panel.find(`.amor__ov-edit[data-k="${key}"]`).val() || '').trim();
         if (key === 'nsfw') {
-            settings.nsfwPrompt = (text && text !== NSFW_DEFAULT) ? text : '';
+            settings.nsfwPrompt = (text && text !== nsfwDefault()) ? text : '';
             saveSettings();
             updatePromptInjection();
             renderNsfw();
@@ -2562,7 +2573,7 @@ function renderOverview() {
     const dirAuto = buildDirectorPromptAuto();
     preview('dir', '导演台指令', settings.enabled, dirOv, dirAuto, settings.enabled ? buildDirectorPrompt() : '', '导演台未开启，不会注入；开启后才生效。',
         (dirOv && settings.dirOverrideBase && settings.dirOverrideBase !== JSON.stringify(snapshotDirector())) ? '你保存这份手写版本之后，导演台的设置（节奏 / 镜头 / 重点 / 风格等）又改过，现在的手写版本不会反映这些改动。可以看看自动版，需要的话点「恢复自动生成」。' : '');
-    preview('nsfw', 'NSFW 提示词', settings.nsfw, !!(settings.nsfwPrompt || '').trim(), NSFW_DEFAULT, settings.nsfw ? nsfwText() : '', 'NSFW 未开启，不会发送；在「导演台」顶部打开。', '');
+    preview('nsfw', 'NSFW 提示词', settings.nsfw, !!(settings.nsfwPrompt || '').trim(), nsfwDefault(), settings.nsfw ? nsfwText() : '', 'NSFW 未开启，不会发送；在「导演台」顶部打开。', '');
     const planAuto = (() => { try { return buildPlanBlock(s, cd); } catch (e) { return ''; } })();
     const planActive = p.enabled && p.mode !== 'manual';
     preview('plan', '剧情规划指令', planActive, planOv, planAuto, planActive ? currentPlanInjection() : '', p.enabled ? '手动模式只分析，不注入。' : '剧情规划未开启，不会注入。',
@@ -2787,7 +2798,11 @@ function buildPanel() {
         </div>
         <div class="amor__auto-ctl amor__nsfw-box">
           <label class="amor__auto-ctl-row"><span class="amor__switch"><input type="checkbox" class="amor__nsfw"><span class="amor__switch-slider"></span></span><span class="amor__master-label">NSFW 一键开启</span></label>
-          <div class="amor__hint">独立开关，不需要先开导演模式。开启后每次生成都会把下面这段提示词放在聊天记录靠近末尾处发给模型。</div>
+          <div class="amor__hint">独立开关，不需要先开导演模式。开启后每次生成都会把下面这段提示词放在聊天记录靠近末尾处发给模型。「主动推进」会让 AI 角色直接把场景带向亲密内容，不用等剧情铺垫；「顺其自然」只给描写许可，剧情走到了才写。</div>
+          <div class="amor__seg amor__nsfw-mode" style="margin-top:10px">
+            <button type="button" class="amor__seg-btn" data-v="push">主动推进（直接带向亲密内容）</button>
+            <button type="button" class="amor__seg-btn" data-v="allow">顺其自然（剧情到了才写）</button>
+          </div>
           <div class="amor__nsfw-state amor__p-th-meta"></div>
           <details class="amor__ov-pv amor__nsfw-pv">
             <summary>查看 / 修改提示词</summary>
@@ -2936,8 +2951,9 @@ function renderPanel() {
 
 function renderNsfw() {
     const panel = $('#st-amor');
+    panel.find('.amor__nsfw-mode .amor__seg-btn').each(function () { $(this).toggleClass('on', $(this).data('v') === settings.nsfwMode); });
     panel.find('.amor__nsfw-state').text(settings.nsfw
-        ? '当前：已开启（' + nsfwText().length + ' 字）' + ((settings.nsfwPrompt || '').trim() ? ' · 使用你改过的版本' : '')
+        ? '当前：已开启（' + nsfwText().length + ' 字）' + ((settings.nsfwPrompt || '').trim() ? ' · 使用你改过的版本（切换档位不会改它，点「恢复默认」回到所选档位）' : '')
         : '当前：未开启，不会发送。');
     const ta = panel.find('.amor__nsfw-text');
     if (!ta.is(':focus')) ta.val(nsfwText());
@@ -2968,6 +2984,7 @@ function buildExport() {
         settings: Object.assign(snapshotDirector(), {
             dirOverride: settings.dirOverride,
             nsfw: settings.nsfw,
+            nsfwMode: settings.nsfwMode,
             nsfwPrompt: settings.nsfwPrompt,
             presets: clone(settings.presets),
             planner: { enabled: p.enabled, mode: p.mode, everyN: p.everyN, urgentReplan: p.urgentReplan, tokenBudget: p.tokenBudget },
@@ -2998,6 +3015,7 @@ function applyImportedSettings(src) {
     const init = {};
     for (const r of INITIATIVE_ROLES) init[r.key] = INIT_LEVELS.includes(src.initiative && src.initiative[r.key]) ? src.initiative[r.key] : def.initiative[r.key];
     if (typeof src.nsfw === 'boolean') keep.nsfw = src.nsfw;
+    if (src.nsfwMode === 'allow' || src.nsfwMode === 'push') keep.nsfwMode = src.nsfwMode;
     if (typeof src.nsfwPrompt === 'string') keep.nsfwPrompt = src.nsfwPrompt.slice(0, 4000);
     Object.assign(settings, keep, { focus, initiative: init });
     settings.dirOverrideBase = keep.dirOverride ? JSON.stringify(snapshotDirector()) : '';
@@ -3058,9 +3076,15 @@ function bindPanelEvents() {
         syncAutoRefreshTimer();
     });
 
+    panel.on('click', '.amor__nsfw-mode .amor__seg-btn', function () {
+        settings.nsfwMode = $(this).data('v') === 'allow' ? 'allow' : 'push';
+        saveSettings(); updatePromptInjection();
+        panel.find('.amor__nsfw-text').blur();
+        renderNsfw(); renderOverview();
+    });
     panel.on('click', '.amor__nsfw-save', function () {
         const t = String(panel.find('.amor__nsfw-text').val() || '').trim();
-        settings.nsfwPrompt = (t && t !== NSFW_DEFAULT) ? t : '';
+        settings.nsfwPrompt = (t && t !== nsfwDefault()) ? t : '';
         saveSettings(); updatePromptInjection();
         panel.find('.amor__nsfw-text').blur();
         renderNsfw(); renderOverview();
