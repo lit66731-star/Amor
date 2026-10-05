@@ -17,7 +17,7 @@ import { selected_group } from '../../../group-chats.js';
 import { getStringHash } from '../../../utils.js';
 
 const extensionName = 'amor';
-const VERSION = '1.10.3';
+const VERSION = '1.10.4';
 
 // ---------------- 维度常量 ----------------
 const RHYTHMS = ['平缓', '日常', '暧昧', '紧张', '冲突', '高潮', '余波'];
@@ -68,6 +68,7 @@ function freshSettings() {
         pacing: 5,             // 0-10，0=慢 10=快
         custom: '',            // 自定义导演指令
         style: '',             // 内置风格 id（STYLE_PRESETS），空 = 无
+        dirOverride: '',       // 手动覆盖导演指令全文，空 = 自动生成
         autoDirector: false,   // 自动导演模式（每轮生成后 AI 分析并调整旋钮）
         autoNote: '',          // AI 自动生成的导演指令
         lastAnalysisAt: 0,     // 上次自动分析时间戳
@@ -104,6 +105,7 @@ function loadSettings() {
     if (typeof s.rhythm !== 'string') s.rhythm = '';
     if (typeof s.camera !== 'string') s.camera = '';
     if (typeof s.custom !== 'string') s.custom = '';
+    if (typeof s.dirOverride !== 'string') s.dirOverride = '';
     if (typeof s.style !== 'string' || !STYLE_PRESETS.some(x => x.id === s.style)) s.style = '';
     if (s.pacing == null) s.pacing = def.pacing;
     if (typeof s.autoDirector !== 'boolean') s.autoDirector = !!s.autoDirector;
@@ -154,6 +156,10 @@ function pacingDesc(v) {
 }
 function buildDirectorPrompt() {
     if (!settings.enabled) return '';
+    const ov = (settings.dirOverride || '').trim();
+    return ov || buildDirectorPromptAuto();
+}
+function buildDirectorPromptAuto() {
     const lines = ['[Amor 导演指令]'];
     lines.push('以下是你本轮剧情创作必须严格遵守的导演指令，优先级高于角色设定与历史对话，请完全依照它来创作本段剧情，不要偏离。');
     if (settings.autoDirector && settings.autoNote && settings.autoNote.trim()) lines.push('· 导演特别指示：' + settings.autoNote.trim() + '。');
@@ -439,6 +445,7 @@ function normalizePlanChat(cd) {
     if (!cd.choices || typeof cd.choices !== 'object' || !Array.isArray(cd.choices.options)) cd.choices = null;
     if (!Array.isArray(cd.snapshots)) cd.snapshots = [];
     if (!Array.isArray(cd.outcomes)) cd.outcomes = [];
+    if (typeof cd.planOverride !== 'string') cd.planOverride = '';
     if (typeof cd.lastSeenKey !== 'string') cd.lastSeenKey = '';
     if (typeof cd.roundsSincePlan !== 'number') cd.roundsSincePlan = 0;
     if (typeof cd.lastUrgentRev !== 'number') cd.lastUrgentRev = -99;
@@ -1630,7 +1637,7 @@ function buildPlanBlock(s, cd) {
 function currentPlanInjection() {
     try {
         const cd = plannerChatData();
-        if (settings.planner.enabled && settings.planner.mode !== 'manual' && cd) return buildPlanBlock(cd.directorState, cd);
+        if (settings.planner.enabled && settings.planner.mode !== 'manual' && cd) return (cd.planOverride || '').trim() || buildPlanBlock(cd.directorState, cd);
     } catch (e) {
         console.warn('[Amor] 构建规划注入失败：', e);
     }
@@ -1820,6 +1827,41 @@ function bindPlannerEvents() {
         panel.find('[data-page]').hide().filter(`[data-page="${tab}"]`).show();
         if (tab === 'planner') renderPlanner();
         if (tab === 'overview') renderOverview();
+    });
+
+    panel.on('click', '.amor__ov-save', function () {
+        const key = $(this).attr('data-k');
+        const text = String(panel.find(`.amor__ov-edit[data-k="${key}"]`).val() || '').trim();
+        if (key === 'dir') {
+            settings.dirOverride = (text && text !== buildDirectorPromptAuto().trim()) ? text : '';
+            saveSettings();
+            updatePromptInjection();
+        } else {
+            const cd = plannerEnsureChat();
+            if (!cd) { toastr.warning('请先打开一个聊天'); return; }
+            cd.planOverride = (text && text !== buildPlanBlock(cd.directorState, cd).trim()) ? text : '';
+            saveSettings();
+            updatePlannerInjection();
+        }
+        panel.find('.amor__ov-edit').blur();
+        renderOverview();
+        toastr.success('已保存');
+    });
+    panel.on('click', '.amor__ov-restore', function () {
+        const key = $(this).attr('data-k');
+        if (key === 'dir') {
+            settings.dirOverride = '';
+            saveSettings();
+            updatePromptInjection();
+        } else {
+            const cd = plannerEnsureChat();
+            if (!cd) return;
+            cd.planOverride = '';
+            saveSettings();
+            updatePlannerInjection();
+        }
+        panel.find('.amor__ov-edit').blur();
+        renderOverview();
     });
 
     panel.on('change', '.amor__p-enabled', function () {
@@ -2313,6 +2355,8 @@ const PLANNER_MODE_LABEL = { assisted: '辅助', autonomous: '自动导演', man
 function renderOverview() {
     const box = $('#st-amor .amor__ov');
     if (!box.length) return;
+    if (box.find('textarea:focus').length) return;
+    const openKeys = box.find('details[open]').map(function () { return $(this).attr('data-k'); }).get();
     box.empty();
     const cd = (currentChatKey() && settings.planner) ? (plannerChatData() || freshPlanChat()) : null;
     if (!cd) { box.append($('<div class="amor__p-empty">').text('请先打开一个聊天。')); return; }
@@ -2322,16 +2366,27 @@ function renderOverview() {
     const sec = (title) => { const d = $('<div class="amor__section">').append($('<div class="amor__label">').text(title)); box.append(d); return d; };
     const item = (d, label, val) => { if (!val) return; if (label) d.append($('<div class="amor__ov-label">').text(label)); d.append($('<div class="amor__ov-val">').text(val)); };
 
-    const pv = sec('当前注入内容（下一条回复实际会收到的 Amor 指令，只读）');
-    const dirText = settings.enabled ? buildDirectorPrompt() : '';
-    const planText = currentPlanInjection();
-    const preview = (title, text, empty) => {
-        const d = $('<details class="amor__ov-pv">').append($('<summary>').text(title + (text ? '（' + text.length + ' 字）' : '（无）')));
-        d.append($('<pre class="amor__ov-pre">').text(text || empty));
+    const pv = sec('当前注入内容（下一条回复实际会收到的 Amor 指令，可直接修改）');
+    const dirOv = !!(settings.dirOverride || '').trim();
+    const planOv = !!(cd.planOverride || '').trim();
+    const preview = (key, title, active, ov, autoText, effText, offNote) => {
+        const d = $('<details class="amor__ov-pv">').attr('data-k', key).prop('open', openKeys.includes(key));
+        d.append($('<summary>').text(title + (active ? '（' + effText.length + ' 字）' : '（未注入）') + (ov ? ' · 已手动覆盖' : '')));
+        if (!active) d.append($('<div class="amor__p-empty">').text(offNote));
+        d.append($('<textarea class="amor__p-text amor__ov-edit" spellcheck="false" rows="8">').attr('data-k', key).val(effText || autoText));
+        d.append($('<div class="amor__p-rx-btns">').append(
+            $('<button type="button" class="amor__direct-now amor__ov-save">').attr('data-k', key).text('保存修改'),
+            $('<button type="button" class="amor__p-reset amor__ov-restore">').attr('data-k', key).text('恢复自动生成').prop('disabled', !ov)));
+        d.append($('<div class="amor__hint">').text(ov
+            ? '正在使用你手动写的版本，不会再随设置或规划变化；点「恢复自动生成」回到自动。'
+            : '修改后点保存，就会替换自动生成的内容；清空后保存也等于恢复自动。'));
         pv.append(d);
     };
-    preview('导演台指令', dirText, settings.enabled ? '导演台没有产生任何指令。' : '导演台未开启，不注入。');
-    preview('剧情规划指令', planText, p.enabled ? (p.mode === 'manual' ? '手动模式：只分析，不注入。' : '还没有规划内容，暂不注入。') : '剧情规划未开启，不注入。');
+    const dirAuto = buildDirectorPromptAuto();
+    preview('dir', '导演台指令', settings.enabled, dirOv, dirAuto, settings.enabled ? buildDirectorPrompt() : '', '导演台未开启，不会注入；开启后才生效。');
+    const planAuto = (() => { try { return buildPlanBlock(s, cd); } catch (e) { return ''; } })();
+    const planActive = p.enabled && p.mode !== 'manual';
+    preview('plan', '剧情规划指令', planActive, planOv, planAuto, planActive ? currentPlanInjection() : '', p.enabled ? '手动模式只分析，不注入。' : '剧情规划未开启，不会注入。');
 
     const st = sec('运行状态');
     const bits = [

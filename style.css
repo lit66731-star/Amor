@@ -446,6 +446,9 @@
     color: var(--amor-text); font-family: inherit;
 }
 
+#st-amor .amor__ov-edit { margin-top: 8px; font-size: 12px; }
+#st-amor .amor__ov-pv .amor__p-rx-btns { margin-top: 8px; }
+
 /* 移动端 */
 @media (max-width: 480px) {
     #st-amor .amor__body { padding: 16px 14px 40px; }
