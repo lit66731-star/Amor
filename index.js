@@ -17,7 +17,7 @@ import { selected_group } from '../../../group-chats.js';
 import { getStringHash } from '../../../utils.js';
 
 const extensionName = 'amor';
-const VERSION = '1.14.0';
+const VERSION = '1.14.1';
 
 // ---------------- 维度常量 ----------------
 const RHYTHMS = ['平缓', '日常', '暧昧', '紧张', '冲突', '高潮', '余波'];
@@ -2713,7 +2713,7 @@ function renderPlanner() {
         const v = getPath(s, $(this).data('path'));
         $(this).val(Array.isArray(v) ? v.join('\n') : (v || ''));
     });
-    panel.find('.amor__p-bar i').css('width', s.tension + '%');
+    panel.find('.amor__p-tension .amor__p-bar i').css('width', s.tension + '%');
     panel.find('.amor__p-tension-val').text(s.tension);
     const warn = panel.find('.amor__p-warn');
     if (s.stagnantRounds >= 1) warn.text('剧情近期有空转迹象（连续 ' + s.stagnantRounds + ' 轮），下一个节拍会尝试引入变化。').show();
