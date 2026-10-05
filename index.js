@@ -17,7 +17,7 @@ import { selected_group } from '../../../group-chats.js';
 import { getStringHash } from '../../../utils.js';
 
 const extensionName = 'amor';
-const VERSION = '1.11.0';
+const VERSION = '1.12.0';
 
 // ---------------- 维度常量 ----------------
 const RHYTHMS = ['平缓', '日常', '暧昧', '紧张', '冲突', '高潮', '余波'];
@@ -1851,6 +1851,16 @@ function plannerPageHtml() {
           <div class="amor__p-field"><div class="amor__p-field-label">模型名</div><input type="text" class="amor__p-api" data-api="model" autocomplete="off"></div>
         </div>
 
+        <div class="amor__section">
+          <div class="amor__label">备份与迁移</div>
+          <div class="amor__p-rx-btns" style="margin-top:0">
+            <button type="button" class="amor__p-reset amor__io-export">导出备份</button>
+            <button type="button" class="amor__p-reset amor__io-import">导入备份</button>
+            <input type="file" class="amor__io-file" accept=".json,application/json" style="display:none">
+          </div>
+          <div class="amor__hint">备份包含：导演台设置与预设、规划设置，以及当前聊天的 Amor 规划数据。不包含 API 地址和 Key，也不包含 Serendipity 的任何内容。导入时设置会覆盖当前值，预设按名称合并（同名跳过）。</div>
+        </div>
+
         <div class="amor__hint">剧情规划和「导演台」是两件事：导演台调的是「怎么写」（节奏 / 镜头 / 重点），规划决定的是「写什么」——这一幕的目标、冲突和下一个要发生的具体变化。每轮回复结束后，规划会先评估上一个节拍实际发生了什么，再重新规划，并把建议注入下一轮。规划只是建议，不会写入 Serendipity 的事实；删除消息、重新生成、Swipe 时会自动回滚。</div>
       </div>`;
 }
@@ -1866,6 +1876,60 @@ function bindPlannerEvents() {
         if (tab === 'overview') renderOverview();
     });
 
+    panel.on('click', '.amor__io-export', function () {
+        try {
+            const data = buildExport();
+            const d = new Date();
+            const stamp = d.getFullYear() + String(d.getMonth() + 1).padStart(2, '0') + String(d.getDate()).padStart(2, '0') + '-' + String(d.getHours()).padStart(2, '0') + String(d.getMinutes()).padStart(2, '0');
+            downloadText('amor-backup-' + stamp + '.json', JSON.stringify(data, null, 2));
+            toastr.success(data.chat ? '已导出设置与当前聊天的规划数据' : '已导出设置（当前聊天还没有规划数据）');
+        } catch (e) {
+            console.warn('[Amor] 导出失败：', e);
+            toastr.error('导出失败：' + safeErrorText(e, settings.planner.api.key));
+        }
+    });
+    panel.on('click', '.amor__io-import', function () { panel.find('.amor__io-file').val('').trigger('click'); });
+    panel.on('change', '.amor__io-file', async function () {
+        const file = this.files && this.files[0];
+        if (!file) return;
+        let data;
+        try {
+            if (file.size > 20 * 1024 * 1024) throw new Error('文件过大');
+            data = JSON.parse(await file.text());
+        } catch (e) { toastr.error('读取失败：这不是有效的 JSON 文件'); return; }
+        if (!data || data.app !== EXPORT_APP || !data.settings) { toastr.error('这不是 Amor 的备份文件'); return; }
+        if (Number(data.format) > EXPORT_FORMAT) { toastr.error('备份来自更新版本的 Amor，请先升级后再导入'); return; }
+        try {
+            let msg = '导入这份备份？\n· 导演台与规划设置会覆盖当前值（API 地址和 Key 不受影响）';
+            let useChat = false;
+            if (data.chat && data.chat.data && typeof data.chat.data === 'object') {
+                if (currentChatKey()) {
+                    const m = chat[data.chat.lastIndex];
+                    const match = !!(m && data.chat.lastHash && msgHash(m) === data.chat.lastHash);
+                    msg += '\n· 同时用备份里的规划数据覆盖【当前聊天】的 Amor 规划数据';
+                    if (!match) msg += '\n  （注意：备份对应的最后一条消息与当前聊天不一致，导入后规划会按当前聊天自动回滚或重新评估）';
+                    useChat = true;
+                }
+            }
+            if (!confirm(msg)) return;
+            applyImportedSettings(data.settings);
+            if (useChat) {
+                const key = currentChatKey();
+                settings.planner.chats[key] = normalizePlanChat(clone(data.chat.data));
+                settings.planner.chats[key].lastSeenKey = '';
+                settings.planner.chats[key].meta.updatedAt = Date.now();
+            }
+            saveSettings();
+            renderPanel();
+            renderPlanner();
+            updatePromptInjection();
+            updatePlannerInjection();
+            toastr.success(useChat ? '已导入设置和当前聊天的规划数据' : '已导入设置');
+        } catch (e) {
+            console.warn('[Amor] 导入失败：', e);
+            toastr.error('导入失败：' + safeErrorText(e, settings.planner.api.key));
+        }
+    });
     panel.on('click', '.amor__p-hist-back', function () {
         const cd = plannerEnsureChat();
         if (!cd) return;
@@ -2813,6 +2877,74 @@ function renderPresets() {
           <button type="button" class="amor__preset-del" data-id="${p.id}">删除</button>
         </div>`);
     });
+}
+
+// ---------------- 导出 / 导入 ----------------
+const EXPORT_APP = 'amor-backup';
+const EXPORT_FORMAT = 1;
+
+function buildExport() {
+    const p = settings.planner;
+    const out = {
+        app: EXPORT_APP, format: EXPORT_FORMAT, version: VERSION, exportedAt: Date.now(),
+        settings: Object.assign(snapshotDirector(), {
+            dirOverride: settings.dirOverride,
+            presets: clone(settings.presets),
+            planner: { enabled: p.enabled, mode: p.mode, everyN: p.everyN, urgentReplan: p.urgentReplan, tokenBudget: p.tokenBudget },
+        }),
+    };
+    const cd = plannerChatData();
+    if (cd) {
+        const last = cd.snapshots[cd.snapshots.length - 1];
+        out.chat = { data: clone(cd), lastIndex: last ? last.msgIndex : -1, lastHash: last ? last.hash : '' };
+    }
+    return out;
+}
+
+// 校验并写回设置；只接受已知字段，不碰 API 地址 / Key
+function applyImportedSettings(src) {
+    if (!src || typeof src !== 'object') return;
+    const def = freshSettings();
+    const keep = {
+        rhythm: RHYTHMS.includes(src.rhythm) ? src.rhythm : '',
+        camera: CAMERAS.includes(src.camera) ? src.camera : '',
+        pacing: Number.isFinite(src.pacing) ? Math.max(0, Math.min(10, src.pacing)) : def.pacing,
+        custom: typeof src.custom === 'string' ? src.custom : '',
+        style: STYLE_PRESETS.some(x => x.id === src.style) ? src.style : '',
+        dirOverride: typeof src.dirOverride === 'string' ? src.dirOverride : '',
+    };
+    const focus = {};
+    for (const f of FOCUS_KEYS) focus[f.key] = Number.isFinite(src.focus && src.focus[f.key]) ? Math.max(0, Math.min(10, src.focus[f.key])) : def.focus[f.key];
+    const init = {};
+    for (const r of INITIATIVE_ROLES) init[r.key] = INIT_LEVELS.includes(src.initiative && src.initiative[r.key]) ? src.initiative[r.key] : def.initiative[r.key];
+    Object.assign(settings, keep, { focus, initiative: init });
+    if (Array.isArray(src.presets)) {
+        const names = new Set(settings.presets.map(x => x.name));
+        for (const pr of src.presets) {
+            if (!pr || typeof pr.name !== 'string' || !pr.name || !pr.data || typeof pr.data !== 'object') continue;
+            if (names.has(pr.name)) continue;
+            settings.presets.push({ id: uid(), name: cleanStr(pr.name, 40), data: clone(pr.data) });
+            names.add(pr.name);
+        }
+    }
+    const sp = src.planner;
+    if (sp && typeof sp === 'object') {
+        const p = settings.planner;
+        if (typeof sp.enabled === 'boolean') p.enabled = sp.enabled;
+        if (['assisted', 'autonomous', 'manual'].includes(sp.mode)) p.mode = sp.mode;
+        if (Number.isFinite(sp.everyN) && sp.everyN >= 1) p.everyN = Math.min(20, Math.floor(sp.everyN));
+        if (typeof sp.urgentReplan === 'boolean') p.urgentReplan = sp.urgentReplan;
+        if (Number.isFinite(sp.tokenBudget) && sp.tokenBudget >= 500) p.tokenBudget = Math.min(8000, Math.floor(sp.tokenBudget));
+    }
+}
+
+function downloadText(filename, text) {
+    const blob = new Blob([text], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = filename;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 2000);
 }
 
 function snapshotDirector() {
