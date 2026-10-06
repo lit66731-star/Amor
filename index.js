@@ -1,7 +1,6 @@
 import { extension_settings } from '../../../extensions.js';
 import {
     chat,
-    generateRaw,
     getRequestHeaders,
     eventSource,
     event_types,
@@ -17,7 +16,7 @@ import { selected_group } from '../../../group-chats.js';
 import { getStringHash } from '../../../utils.js';
 
 const extensionName = 'amor';
-const VERSION = '1.15.0';
+const VERSION = '1.15.1';
 
 // ---------------- 维度常量 ----------------
 const RHYTHMS = ['平缓', '日常', '暧昧', '紧张', '冲突', '高潮', '余波'];
@@ -89,7 +88,7 @@ function freshPlanner() {
         everyN: 1,             // 每几轮规划一次
         urgentReplan: true,    // 巡检发现严重问题 / 节拍屡次落空时，不等 everyN 提前重规划
         tokenBudget: 2500,     // 向 Serendipity 索取事实的预算
-        api: { url: '', key: '', model: '' },   // 规划专用模型，留空则用酒馆当前 API
+        api: { url: '', key: '', model: '' },   // 插件 API：所有要调模型的功能（规划/导演/会诊/选项）只用它，不回退聊天 API
         chats: {},             // 按「角色 + 聊天」分开存的规划状态
     };
 }
@@ -297,6 +296,7 @@ function parseDirectorOutput(text) {
 let isAutoDirecting = false;
 async function autoDirect() {
     if (!settings.autoDirector || isAutoDirecting) return;
+    if (!plannerApiConfigured()) return; // 未配置插件 API：跳过自动导演，不回退聊天 API
     const transcript = buildTranscript();
     if (!transcript) return;
     isAutoDirecting = true;
@@ -307,7 +307,7 @@ async function autoDirect() {
         const ctx = getStoryContext();
         const contextBlock = ctx ? '剧情背景（整个故事的当前状态，导戏时注意与它保持一致）：\n' + ctx + '\n\n' : '';
         const prompt = DIRECTOR_PROMPT.replace('{contextBlock}', contextBlock).replace('{transcript}', transcript);
-        const result = await runExclusive(() => generateRaw({ prompt, systemPrompt: '你是一位专业的剧情导演，只负责决定下一段剧情怎么导。' }));
+        const result = await runExclusive(() => callPlannerLLM({ prompt, systemPrompt: '你是一位专业的剧情导演，只负责决定下一段剧情怎么导。' }));
         const d = parseDirectorOutput(result);
         settings.rhythm = d.rhythm;
         settings.camera = d.camera;
@@ -599,7 +599,7 @@ function getPlannerFacts() {
     }
 }
 
-// ---- 模型调用（规划专用 API 优先，未设置/失败则用酒馆默认） ----
+// ---- 模型调用（只用插件自带 API，未设置直接报错，绝不回退到聊天 API） ----
 function plannerApiConfigured() {
     const c = settings.planner.api || {};
     return !!(c.url && c.model);
@@ -617,11 +617,6 @@ function safeErrorText(e, key, max = 120) {
         .replace(/\b(sk|rk|pk|ak|key)-[A-Za-z0-9_*-]{6,}/gi, '$1-***')
         .replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
     return t.length > max ? t.slice(0, max) + '…' : t;
-}
-function withTimeout(p, ms) {
-    let t;
-    const timeout = new Promise((_, rej) => { t = setTimeout(() => rej(new Error('请求超时（' + Math.round(ms / 1000) + ' 秒）')), ms); });
-    return Promise.race([p, timeout]).finally(() => clearTimeout(t));
 }
 function plannerBaseUrl(url) {
     return String(url || '').trim().replace(/\/+$/, '').replace(/\/chat\/completions$/i, '');
@@ -719,16 +714,10 @@ async function callPlannerApiDirect({ prompt, systemPrompt }) {
     return out;
 }
 async function callPlannerLLM({ prompt, systemPrompt }) {
-    if (plannerApiConfigured()) {
-        try {
-            return await callPlannerApi({ prompt, systemPrompt });
-        } catch (e) {
-            const detail = safeErrorText(e, settings.planner.api.key);
-            console.warn('[Amor] 规划专用 API 调用失败，改用酒馆默认 API：', detail);
-            toastr.warning('Amor 规划专用 API 调用失败（' + detail + '），已改用酒馆默认 API');
-        }
+    if (!plannerApiConfigured()) {
+        throw new Error('未配置插件 API（不会回退到聊天 API）');
     }
-    return withTimeout(Promise.resolve(generateRaw({ prompt, systemPrompt })), PLAN_TIMEOUT_MS + 60000);
+    return callPlannerApi({ prompt, systemPrompt });
 }
 
 // ---- 剧情线（Plot Thread）：Amor 对故事脉络的归纳，属于解释，不是事实 ----
@@ -1400,6 +1389,7 @@ function applyChoices(cd, raw, lastIdx) {
 let choiceBusy = false;
 async function runChoices(focus) {
     if (!settings.planner.enabled) { toastr.warning('请先开启「剧情规划」'); return; }
+    if (!plannerApiConfigured()) { toastr.warning('请先在「剧情规划」页配置插件 API（不会回退到聊天 API）'); return; }
     if (choiceBusy) return;
     if (!currentChatKey()) { toastr.warning('请先打开一个聊天'); return; }
     const lastIdx = lastRealIndex();
@@ -1481,6 +1471,7 @@ let doctorBusy = false;
 async function runDoctor({ auto = false } = {}) {
     const warn = (t) => { if (!auto) toastr.warning(t); };
     if (!settings.planner.enabled) { warn('请先开启「剧情规划」'); return false; }
+    if (!plannerApiConfigured()) { warn('请先在「剧情规划」页配置插件 API（不会回退到聊天 API）'); return false; }
     if (doctorBusy) return false;
     if (!currentChatKey()) { warn('请先打开一个聊天'); return false; }
     const lastIdx = lastRealIndex();
@@ -1540,6 +1531,7 @@ async function maybeAutoDoctor(cd) {
 
 async function runPlanner({ manual = false, urgent = '' } = {}) {
     if (!settings.planner.enabled) { if (manual) toastr.warning('请先开启「剧情规划」'); return; }
+    if (!plannerApiConfigured()) { if (manual) toastr.warning('请先在「剧情规划」页配置插件 API（不会回退到聊天 API）'); return; }
     if (plannerBusy) return;
     if (!currentChatKey()) { if (manual) toastr.warning('请先打开一个聊天'); return; }
     const lastIdx = lastRealIndex();
@@ -1584,6 +1576,7 @@ async function runPlanner({ manual = false, urgent = '' } = {}) {
 // 生成结束后：有新消息才算一轮，按频率触发规划
 function onPlannerGenerationEnded() {
     if (!settings.planner.enabled || settings.planner.mode === 'manual') return;
+    if (!plannerApiConfigured()) return; // 未配置插件 API：跳过自动规划，不回退聊天 API
     if (!currentChatKey()) return;
     plannerReconcile();
     const idx = lastRealIndex();
@@ -1886,7 +1879,7 @@ function plannerPageHtml() {
             <div class="amor__p-field-label">向 Serendipity 索取事实的 token 预算</div>
             <input type="number" class="amor__p-set" data-set="tokenBudget" min="500" max="8000" step="100">
           </div>
-          <div class="amor__p-field-label amor__p-sub">规划专用模型（留空则用酒馆当前 API）</div>
+          <div class="amor__p-field-label amor__p-sub">插件 API（规划 / 导演 / 会诊 / 选项都用它，未配置时不调用任何 API）</div>
           <div class="amor__p-field"><div class="amor__p-field-label">API 地址（OpenAI 兼容）</div><input type="text" class="amor__p-api" data-api="url" placeholder="https://.../v1" autocomplete="off"></div>
           <div class="amor__p-field"><div class="amor__p-field-label">API Key</div><input type="password" class="amor__p-api" data-api="key" autocomplete="off"></div>
           <div class="amor__p-field"><div class="amor__p-field-label">模型名</div><input type="text" class="amor__p-api" data-api="model" autocomplete="off"></div>
