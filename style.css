@@ -547,3 +547,62 @@
     font-style: normal; font-size: 11px; color: var(--amor-accent);
     border: 1px solid var(--amor-accent); border-radius: 10px; padding: 0 6px; margin-left: 8px;
 }
+
+/* NPC 自主行动 */
+#st-amor .amor__npc-box { margin-top: -8px; }
+#st-amor .amor__npc-box .amor__hint { margin-top: 8px; }
+
+/* 场景导演 */
+#st-amor .amor__scene-hint { margin-top: 6px; }
+
+/* 指令模板 */
+#st-amor .amor__tpl-add { display: flex; flex-direction: column; gap: 8px; margin-bottom: 12px; }
+#st-amor .amor__tpl-name {
+    padding: 8px 12px; font-size: 13px;
+    border: 1px solid var(--amor-border); border-radius: 8px;
+    color: var(--amor-text); background: var(--amor-surface); font-family: inherit;
+}
+#st-amor .amor__tpl-name:focus { outline: none; border-color: var(--amor-accent); }
+#st-amor .amor__tpl-text {
+    width: 100%; box-sizing: border-box; min-height: 52px; resize: vertical;
+    padding: 8px 12px; font-size: 13px; line-height: 1.6;
+    border: 1px solid var(--amor-border); border-radius: 8px;
+    color: var(--amor-text); background: var(--amor-surface); font-family: inherit;
+}
+#st-amor .amor__tpl-text:focus { outline: none; border-color: var(--amor-accent); }
+#st-amor .amor__tpl-add-btns { display: flex; gap: 8px; }
+#st-amor .amor__tpl-row {
+    display: flex; align-items: center; gap: 8px;
+    padding: 8px 0; border-bottom: 1px solid var(--amor-border);
+}
+#st-amor .amor__tpl-row:last-child { border-bottom: none; }
+#st-amor .amor__tpl-toggle {
+    flex: 1; min-width: 0; text-align: left;
+    padding: 7px 12px; font-size: 13px;
+    background: transparent; border: 1px solid var(--amor-border); border-radius: 8px;
+    color: var(--amor-text); cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+#st-amor .amor__tpl-toggle.on {
+    background: var(--amor-accent-soft); border-color: var(--amor-accent); color: var(--amor-dark);
+}
+#st-amor .amor__tpl-edit, #st-amor .amor__tpl-copy, #st-amor .amor__tpl-del {
+    background: transparent; border: 1px solid var(--amor-border);
+    color: var(--amor-text); border-radius: 6px; padding: 5px 10px;
+    font-size: 12px; cursor: pointer; white-space: nowrap;
+}
+#st-amor .amor__tpl-edit:hover, #st-amor .amor__tpl-copy:hover { border-color: var(--amor-accent); color: var(--amor-accent); }
+#st-amor .amor__tpl-del:hover { border-color: #c96a5a; color: #c96a5a; }
+
+/* 注入历史 */
+#st-amor .amor__hist { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
+#st-amor .amor__hist-item { border: 1px solid var(--amor-border); border-radius: 8px; overflow: hidden; }
+#st-amor .amor__hist-item summary {
+    cursor: pointer; padding: 8px 12px; font-size: 12px; color: var(--amor-text-soft);
+    background: var(--amor-bg); user-select: none;
+}
+#st-amor .amor__hist-item[open] summary { border-bottom: 1px solid var(--amor-border); }
+#st-amor .amor__hist-pre {
+    margin: 0; padding: 10px 12px; max-height: 280px; overflow: auto;
+    font-size: 12px; line-height: 1.7; white-space: pre-wrap; word-break: break-word;
+    background: var(--amor-surface); color: var(--amor-text); font-family: inherit;
+}

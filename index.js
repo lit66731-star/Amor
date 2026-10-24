@@ -82,6 +82,34 @@ const DIRECTOR_MODES = [
     { id: 'antitrope', name: '反套路', text: '不要将常见叙事套路视为必然剧情。每次生成前，检查当前发展是否只是对常见情节模板的机械复现。优先根据人物独特的性格、现实处境、既有关系与当前选择推导行为；相同情境可以产生不同结果。允许人物做出不符合常见套路、但符合自身逻辑的选择。不要为了制造新鲜感而刻意反套路，也不要强行制造意外；真正的变化应当来自人物与情境本身，而不是作者对套路的刻意规避。' },
 ];
 
+// 场景导演：场景类型一键套用镜头/重点/节奏（与「导演风格」二选一，选场景会清掉风格，反之亦然）
+const SCENE_PRESETS = [
+    { id: 'daily', name: '日常', rhythm: '日常', camera: '中景', focus: { psy: 5, env: 5, dialog: 6, action: 4 }, initiative: { user: '中', ai: '中', npc: '低' }, pacing: 4,
+      hint: '日常场景：生活化的节奏与互动，重在氛围和人物关系，不急着推进剧情。' },
+    { id: 'alone', name: '独处', rhythm: '平缓', camera: '近景', focus: { psy: 9, env: 5, dialog: 4, action: 2 }, initiative: { user: '中', ai: '中', npc: '低' }, pacing: 2,
+      hint: '独处场景：聚焦单个人物的内心与独白，放慢节奏，把情绪和细节写足。' },
+    { id: 'duo', name: '双人互动', rhythm: '暧昧', camera: '近景', focus: { psy: 8, env: 3, dialog: 8, action: 3 }, initiative: { user: '中', ai: '中', npc: '低' }, pacing: 3,
+      hint: '双人互动：聚焦两人的对白、眼神与细微反应，重视潜台词与关系变化。' },
+    { id: 'ensemble', name: '群像', rhythm: '日常', camera: '中景', focus: { psy: 5, env: 5, dialog: 7, action: 5 }, initiative: { user: '中', ai: '中', npc: '高' }, pacing: 4,
+      hint: '群像场景：让与当前事件相关的角色都参与进来，各有目标与反应，人物之间可以有互动。' },
+    { id: 'conflict', name: '冲突', rhythm: '冲突', camera: '人物特写', focus: { psy: 7, env: 3, dialog: 8, action: 6 }, initiative: { user: '中', ai: '高', npc: '高' }, pacing: 7,
+      hint: '冲突场景：张力拉高，台词与动作都要有力度，冲突要有来有回、不要一边倒。' },
+    { id: 'chase', name: '追逐', rhythm: '紧张', camera: '动作描写', focus: { psy: 3, env: 7, dialog: 3, action: 9 }, initiative: { user: '中', ai: '中', npc: '高' }, pacing: 8,
+      hint: '追逐场景：节奏快、动作密集，空间与方位写清楚，每一个动作都推动局势。' },
+    { id: 'intimate', name: '亲密', rhythm: '暧昧', camera: '人物特写', focus: { psy: 8, env: 3, dialog: 4, action: 7 }, initiative: { user: '中', ai: '高', npc: '高' }, pacing: 3,
+      hint: '亲密场景：从距离、触感到情绪层层推进，具体、细腻，重视双方的互动与感受。' },
+    { id: 'transition', name: '过渡场景', rhythm: '平缓', camera: '环境描写', focus: { psy: 4, env: 7, dialog: 5, action: 3 }, initiative: { user: '中', ai: '中', npc: '低' }, pacing: 4,
+      hint: '过渡场景：用简洁的转场与氛围描写衔接前后情节，点到为止，不拖沓。' },
+];
+
+const NPC_AUTONOMY_LEVELS = [
+    { v: 'scene', label: '仅在当前场景行动', text: 'NPC 只在当前场景、当前事件里行动，不引发场外事件。' },
+    { v: 'offscene', label: '允许场外事件', text: 'NPC 可以发起发生在玩家不在场处的事件，这些事件作为背景信息带出，但不直接影响主线走向。' },
+    { v: 'plot', label: '允许场外事件影响主线', text: 'NPC 可以发起场外事件，且这些事件可以影响主线走向。' },
+];
+
+const HISTORY_LIMIT = 50;
+
 // ---------------- 状态 ----------------
 function freshSettings() {
     return {
@@ -97,6 +125,12 @@ function freshSettings() {
         custom: '',            // 自定义导演指令
         style: '',             // 内置风格 id（STYLE_PRESETS），空 = 无
         directorModes: [],     // 已开启的导演台指令 id（DIRECTOR_MODES）
+        scene: '',             // 当前场景类型 id（SCENE_PRESETS），空 = 无；与风格互斥
+        autoScene: false,      // 每轮由 AI 判断当前场景并自动套用（独立于自动导演）
+        npcAutonomy: false,    // NPC 自主行动（独立于导演模式）
+        npcAutonomyLevel: 'scene',   // scene 仅当前场景 | offscene 允许场外事件 | plot 允许场外事件影响主线
+        instructionTemplates: [],     // 自定义指令模板 [{ id, name, text, on }]
+        injectionHistory: [],         // 每次生成实际注入的导演指令（最近 N 条）
         dirOverride: '',       // 手动覆盖导演指令全文，空 = 自动生成
         dirOverrideBase: '',   // 保存覆盖时的导演台旋钮快照，用来判断自动版是否已变
         autoDirector: false,   // 自动导演模式（每轮生成后 AI 分析并调整旋钮）
@@ -157,6 +191,12 @@ function loadSettings() {
         s.builtinSeeded = true;
     }
     if (!Array.isArray(s.directorModes)) s.directorModes = [];
+    if (typeof s.scene !== 'string' || !SCENE_PRESETS.some(x => x.id === s.scene)) s.scene = '';
+    if (typeof s.autoScene !== 'boolean') s.autoScene = false;
+    if (typeof s.npcAutonomy !== 'boolean') s.npcAutonomy = false;
+    if (!['scene', 'offscene', 'plot'].includes(s.npcAutonomyLevel)) s.npcAutonomyLevel = 'scene';
+    if (!Array.isArray(s.instructionTemplates)) s.instructionTemplates = [];
+    if (!Array.isArray(s.injectionHistory)) s.injectionHistory = [];
     const pdef = freshPlanner();
     const p = (s.planner && typeof s.planner === 'object' && !Array.isArray(s.planner)) ? s.planner : {};
     p.api = Object.assign({}, pdef.api, (p.api && typeof p.api === 'object') ? p.api : {});
@@ -215,8 +255,13 @@ function buildDirectorPromptAuto() {
     lines.push('· 剧情推进速度：' + pacingDesc(settings.pacing != null ? settings.pacing : 5));
     const st = STYLE_PRESETS.find(x => x.id === settings.style);
     if (st && st.hint) lines.push('· 风格基调（' + st.name + '，只影响怎么写，不改变任何事实与设定）：' + st.hint);
+    const sc = SCENE_PRESETS.find(x => x.id === settings.scene);
+    if (sc && sc.hint) lines.push('· 当前场景（' + sc.name + '）：' + sc.hint);
     for (const m of DIRECTOR_MODES) {
         if ((settings.directorModes || []).includes(m.id)) lines.push('· 导演指令（' + m.name + '）：' + m.text);
+    }
+    for (const t of (settings.instructionTemplates || [])) {
+        if (t && t.on && t.text && String(t.text).trim()) lines.push('· 指令模板（' + (t.name || '未命名') + '）：' + String(t.text).trim());
     }
     if (settings.custom && settings.custom.trim()) lines.push('· 自定义导演指令：' + settings.custom.trim());
     return lines.join('\n');
@@ -241,9 +286,23 @@ function nsfwDefault() { return settings.nsfwMode === 'allow' ? NSFW_ALLOW : NSF
 function nsfwText() { return (settings.nsfwPrompt || '').trim() || nsfwDefault(); }
 function buildNsfwPrompt() { return settings.nsfw ? nsfwText() : ''; }
 
+function npcAutonomyText() {
+    const lv = NPC_AUTONOMY_LEVELS.find(x => x.v === settings.npcAutonomyLevel) || NPC_AUTONOMY_LEVELS[0];
+    return [
+        '[Amor NPC 自主行动]',
+        '在场的 NPC 可以主动联系、提出要求、采取行动，也可以发展自己与其他角色的关系。',
+        '· ' + lv.label + '：' + lv.text,
+        '· 每个 NPC 的行动都要符合其性格、目标与知识边界：不知道的事不能说、不能做。',
+        '· 保持平衡：不要让 NPC 完全静止，也不要让某个 NPC 突然抢戏、盖过当前主线。',
+        '· 不替玩家角色做决定，也不代写玩家角色的台词与动作。',
+    ].join('\n');
+}
+function buildNpcPrompt() { return settings.npcAutonomy ? npcAutonomyText() : ''; }
+
 function updatePromptInjection() {
     // 放在聊天记录靠近末尾处（深度 1），比放在提示词最前面更不容易被角色设定和历史淹没
     setExtensionPrompt('amor_nsfw', buildNsfwPrompt(), extension_prompt_types.IN_CHAT, 1);
+    setExtensionPrompt('amor_npc', buildNpcPrompt(), extension_prompt_types.IN_CHAT, 1);
     setExtensionPrompt(
         'amor_director',
         buildDirectorPrompt(),
@@ -265,6 +324,7 @@ const DIRECTOR_PROMPT = `你是 Amor 导演台的剧情导演。根据下面给�
 
 可用节奏：${RHYTHMS.join('/')}
 可用镜头：${CAMERAS.join('/')}
+可用场景：${SCENE_PRESETS.map(x => x.name).join('/')}
 叙事重点（人物心理/环境描写/对白/动作，各 0-10，条越满越侧重）
 角色主动性（用户角色/AI角色/NPC，各 低/中/高）
 推进速度（0-10，0 极慢，10 极快）
@@ -275,6 +335,7 @@ const DIRECTOR_PROMPT = `你是 Amor 导演台的剧情导演。根据下面给�
 严格按下面格式输出，每行一项，不要多余内容，不要用 markdown：
 【节奏】<节奏词>
 【镜头】<镜头词>
+【场景】<场景词，从上面的可用场景里选一个最贴合的，拿不准就留空>
 【心理】<0-10>
 【环境】<0-10>
 【对白】<0-10>
@@ -316,6 +377,7 @@ function parseDirectorOutput(text) {
     return {
         rhythm: pick(get('节奏'), RHYTHMS),
         camera: pick(get('镜头'), CAMERAS),
+        scene: pick(get('场景'), SCENE_PRESETS.map(x => x.name)),
         focus: {
             psy: clamp(get('心理'), 0, 10, 5),
             env: clamp(get('环境'), 0, 10, 3),
@@ -332,15 +394,28 @@ function parseDirectorOutput(text) {
     };
 }
 
+// 场景与风格互斥：套用场景预设会清掉风格（反之在风格点击处清场景）
+function applyScene(id) {
+    const sc = SCENE_PRESETS.find(x => x.id === id);
+    settings.scene = sc ? sc.id : '';
+    if (!sc) return;
+    settings.rhythm = sc.rhythm;
+    settings.camera = sc.camera;
+    settings.focus = Object.assign({}, sc.focus);
+    settings.initiative = Object.assign({}, sc.initiative);
+    settings.pacing = sc.pacing;
+    settings.style = '';
+}
+
 let isAutoDirecting = false;
 async function autoDirect() {
-    if (!settings.autoDirector || isAutoDirecting) return;
+    if ((!settings.autoDirector && !settings.autoScene) || isAutoDirecting) return;
     if (!plannerApiConfigured()) return; // 未配置插件 API：跳过自动导演，不回退聊天 API
     const transcript = buildTranscript();
     if (!transcript) return;
     isAutoDirecting = true;
     if ($('#st-amor').is(':visible')) {
-        $('#st-amor .amor__auto-note').show().find('.amor__auto-note-body').text('导演分析中…');
+        $('#st-amor .amor__auto-note').show().find('.amor__auto-note-body').text('分析中…');
     }
     try {
         const ctx = getStoryContext();
@@ -348,12 +423,18 @@ async function autoDirect() {
         const prompt = DIRECTOR_PROMPT.replace('{contextBlock}', contextBlock).replace('{transcript}', transcript);
         const result = await runExclusive(() => callPlannerLLM({ prompt, systemPrompt: '你是一位专业的剧情导演，只负责决定下一段剧情怎么导。' }));
         const d = parseDirectorOutput(result);
-        settings.rhythm = d.rhythm;
-        settings.camera = d.camera;
-        settings.focus = d.focus;
-        settings.initiative = d.initiative;
-        settings.pacing = d.pacing;
-        settings.autoNote = d.note;
+        if (settings.autoScene) {
+            const sc = SCENE_PRESETS.find(x => x.name === d.scene);
+            if (sc) applyScene(sc.id);
+            if (settings.autoDirector) settings.autoNote = d.note;
+        } else if (settings.autoDirector) {
+            settings.rhythm = d.rhythm;
+            settings.camera = d.camera;
+            settings.focus = d.focus;
+            settings.initiative = d.initiative;
+            settings.pacing = d.pacing;
+            settings.autoNote = d.note;
+        }
         settings.lastAnalysisAt = Date.now();
         saveSettings();
         updatePromptInjection();
@@ -2921,6 +3002,15 @@ function buildPanel() {
             </div>
           </details>
         </div>
+        <div class="amor__auto-ctl amor__npc-box">
+          <label class="amor__auto-ctl-row"><span class="amor__switch"><input type="checkbox" class="amor__npc"><span class="amor__switch-slider"></span></span><span class="amor__master-label">NPC 自主行动</span></label>
+          <div class="amor__hint">独立开关，不需要先开导演模式。开启后 NPC 可以主动联系、提出要求、采取行动、发展自己与其他角色的关系。下面三档选一档，控制 NPC 的行动范围，防止要么完全不动、要么突然抢戏。</div>
+          <div class="amor__seg amor__npc-level" style="margin-top:10px">
+            <button type="button" class="amor__seg-btn" data-v="scene">仅在当前场景行动</button>
+            <button type="button" class="amor__seg-btn" data-v="offscene">允许场外事件</button>
+            <button type="button" class="amor__seg-btn" data-v="plot">允许场外事件影响主线</button>
+          </div>
+        </div>
         <div class="amor__auto-note" style="display:none">
           <div class="amor__auto-note-head">AI 导演指令</div>
           <div class="amor__auto-note-body"></div>
@@ -2942,6 +3032,16 @@ function buildPanel() {
           <div class="amor__label">导演风格（一键套用节奏 / 镜头 / 重点 / 主动性 / 速度，之后仍可逐项微调；只影响怎么写，不改变事实）</div>
           <div class="amor__seg amor__styles"></div>
           <div class="amor__pacing-hint amor__style-hint"></div>
+        </div>
+
+        <div class="amor__section">
+          <div class="amor__label">场景导演（选一个场景，自动套用对应镜头 / 重点 / 节奏；与「导演风格」二选一，选场景会清掉风格）</div>
+          <div class="amor__seg amor__scenes"></div>
+          <div class="amor__pacing-hint amor__scene-hint"></div>
+          <div class="amor__auto-ctl-row" style="margin-top:8px">
+            <label class="amor__switch amor__switch--sm"><input type="checkbox" class="amor__auto-scene"><span class="amor__switch-slider"></span></label>
+            <span class="amor__auto-ctl-label">每轮自动判断场景（由 AI 判断当前场景并套用，独立于自动导演）</span>
+          </div>
         </div>
 
         <div class="amor__section">
@@ -2981,12 +3081,32 @@ function buildPanel() {
         </div>
 
         <div class="amor__section">
+          <div class="amor__label">指令模板（保存你自己的指令，可与上面导演指令叠加；支持命名 / 复制 / 编辑 / 启用 / 删除）</div>
+          <div class="amor__tpl-add">
+            <input type="text" class="amor__tpl-name" placeholder="模板名，如 我的悬疑风格" autocomplete="off">
+            <textarea class="amor__tpl-text" rows="2" spellcheck="false" placeholder="模板内容，如：每轮都要保留一个未解之谜，且不让 NPC 轻易说出关键信息…"></textarea>
+            <div class="amor__tpl-add-btns">
+              <button type="button" class="amor__direct-now amor__tpl-save">保存模板</button>
+              <button type="button" class="amor__p-reset amor__tpl-cancel" style="display:none">取消编辑</button>
+            </div>
+          </div>
+          <div class="amor__tpls"></div>
+        </div>
+
+        <div class="amor__section">
           <div class="amor__label">预设</div>
           <div class="amor__preset-add">
             <input type="text" class="amor__preset-name" placeholder="预设名，如 甜宠日常">
             <button type="button" class="amor__preset-save">保存当前为预设</button>
           </div>
           <div class="amor__presets"></div>
+        </div>
+
+        <div class="amor__section">
+          <details class="amor__ov-pv">
+            <summary>注入历史（最近每次生成实际注入的导演指令，用于排查 OOC / 节奏失控）</summary>
+            <div class="amor__hist"></div>
+          </details>
         </div>
 
         <div class="amor__hint">导演模式开启后，每次生成都会在角色设定之前注入一段「导演指令」，控制 AI 的节奏 / 镜头 / 叙事重点 / 角色主动性 / 推进速度。指令优先级最高，AI 会照着演。开启「自动导演」后，每轮生成结束 AI 会自动分析剧情、调整下方旋钮并写一句导演指令；若已安装 Serendipity，会自动读取其剧情时间/时间线/人物/关系/世界状态/伏笔作为剧情背景。可点「立即导演」手动分析，或开启「定时自动刷新」按间隔持续分析。</div>
@@ -3015,6 +3135,8 @@ function renderPanel() {
     panel.find('.amor__enabled').prop('checked', settings.enabled);
     panel.find('.amor__nsfw').prop('checked', settings.nsfw);
     renderNsfw();
+    panel.find('.amor__npc').prop('checked', settings.npcAutonomy);
+    renderNpcLevel();
     panel.find('.amor__auto').prop('checked', settings.autoDirector);
     panel.toggleClass('amor__on', settings.enabled);
 
@@ -3037,6 +3159,14 @@ function renderPanel() {
     STYLE_PRESETS.forEach(x => sw.append(`<button type="button" class="amor__seg-btn${settings.style === x.id ? ' on' : ''}" data-id="${x.id}">${x.name}</button>`));
     const cur = STYLE_PRESETS.find(x => x.id === settings.style);
     panel.find('.amor__style-hint').text(cur ? (cur.hint || '均衡：不偏向任何一种风格。') : '');
+
+    // 场景导演
+    const sc = panel.find('.amor__scenes').empty();
+    sc.append(`<button type="button" class="amor__seg-btn${settings.scene ? '' : ' on'}" data-id="">无</button>`);
+    SCENE_PRESETS.forEach(x => sc.append(`<button type="button" class="amor__seg-btn${settings.scene === x.id ? ' on' : ''}" data-id="${x.id}">${x.name}</button>`));
+    const curScene = SCENE_PRESETS.find(x => x.id === settings.scene);
+    panel.find('.amor__scene-hint').text(curScene ? (curScene.hint || '') : '');
+    panel.find('.amor__auto-scene').prop('checked', settings.autoScene);
 
     // 剧情节奏
     const r = panel.find('.amor__rhythm').empty();
@@ -3070,7 +3200,9 @@ function renderPanel() {
     panel.find('.amor__custom').val(settings.custom);
 
     renderDirectorModes();
+    renderTemplates();
     renderPresets();
+    renderInjectionHistory();
 }
 
 function renderNsfw() {
@@ -3090,6 +3222,50 @@ function renderDirectorModes() {
     DIRECTOR_MODES.forEach(m => {
         const on = (settings.directorModes || []).includes(m.id);
         el.append(`<button type="button" class="amor__dmode${on ? ' on' : ''}" data-id="${m.id}" title="${escapeHtml(m.text)}">${m.name}</button>`);
+    });
+}
+
+function renderNpcLevel() {
+    const panel = $('#st-amor');
+    panel.find('.amor__npc-level .amor__seg-btn').each(function () { $(this).toggleClass('on', $(this).data('v') === settings.npcAutonomyLevel); });
+}
+
+let editingTemplateId = null;   // 正在编辑的模板 id，空 = 新建
+
+function renderTemplates() {
+    const el = $('#st-amor .amor__tpls');
+    if (!el.length) return;
+    el.empty();
+    const tpls = settings.instructionTemplates || [];
+    if (!tpls.length) { el.append('<div class="amor__preset-empty">暂无模板，先在上方填写并保存。</div>'); return; }
+    tpls.forEach(t => {
+        const on = !!t.on;
+        el.append(`<div class="amor__tpl-row">
+          <button type="button" class="amor__tpl-toggle${on ? ' on' : ''}" data-id="${t.id}" title="${escapeHtml(t.text || '')}">${escapeHtml(t.name || '未命名')}</button>
+          <button type="button" class="amor__tpl-edit" data-id="${t.id}">编辑</button>
+          <button type="button" class="amor__tpl-copy" data-id="${t.id}">复制</button>
+          <button type="button" class="amor__tpl-del" data-id="${t.id}">删除</button>
+        </div>`);
+    });
+}
+
+function fmtTime(ts) {
+    const d = new Date(ts);
+    const p = (n) => String(n).padStart(2, '0');
+    return (d.getMonth() + 1) + '/' + d.getDate() + ' ' + p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
+}
+function renderInjectionHistory() {
+    const el = $('#st-amor .amor__hist');
+    if (!el.length) return;
+    el.empty();
+    const h = settings.injectionHistory || [];
+    if (!h.length) { el.append('<div class="amor__preset-empty">还没有记录。开启导演模式后，每次生成前注入的导演指令会记在这里。</div>'); return; }
+    h.forEach(item => {
+        const text = item && item.text ? String(item.text) : '';
+        el.append(`<details class="amor__hist-item">
+          <summary>${fmtTime(item.ts)} · ${text.length} 字</summary>
+          <pre class="amor__hist-pre">${escapeHtml(text)}</pre>
+        </details>`);
     });
 }
 
@@ -3120,6 +3296,9 @@ function buildExport() {
             nsfw: settings.nsfw,
             nsfwMode: settings.nsfwMode,
             nsfwPrompt: settings.nsfwPrompt,
+            npcAutonomy: settings.npcAutonomy,
+            npcAutonomyLevel: settings.npcAutonomyLevel,
+            instructionTemplates: clone(settings.instructionTemplates),
             presets: clone(settings.presets),
             planner: { enabled: p.enabled, mode: p.mode, everyN: p.everyN, urgentReplan: p.urgentReplan, tokenBudget: p.tokenBudget },
         }),
@@ -3152,6 +3331,14 @@ function applyImportedSettings(src) {
     if (src.nsfwMode === 'allow' || src.nsfwMode === 'push') keep.nsfwMode = src.nsfwMode;
     if (typeof src.nsfwPrompt === 'string') keep.nsfwPrompt = src.nsfwPrompt.slice(0, 4000);
     if (Array.isArray(src.directorModes)) keep.directorModes = src.directorModes.filter(m => DIRECTOR_MODES.some(x => x.id === m));
+    keep.scene = SCENE_PRESETS.some(x => x.id === src.scene) ? src.scene : '';
+    if (typeof src.npcAutonomy === 'boolean') keep.npcAutonomy = src.npcAutonomy;
+    if (['scene', 'offscene', 'plot'].includes(src.npcAutonomyLevel)) keep.npcAutonomyLevel = src.npcAutonomyLevel;
+    if (Array.isArray(src.instructionTemplates)) {
+        keep.instructionTemplates = src.instructionTemplates
+            .filter(t => t && typeof t.name === 'string' && typeof t.text === 'string' && t.text.trim())
+            .map(t => ({ id: uid(), name: cleanStr(t.name, 40), text: t.text.slice(0, 4000), on: !!t.on }));
+    }
     Object.assign(settings, keep, { focus, initiative: init });
     settings.dirOverrideBase = keep.dirOverride ? JSON.stringify(snapshotDirector()) : '';
     if (Array.isArray(src.presets)) {
@@ -3194,6 +3381,7 @@ function snapshotDirector() {
         pacing: settings.pacing,
         custom: settings.custom,
         style: settings.style,
+        scene: settings.scene,
         directorModes: (settings.directorModes || []).slice(),
     };
 }
@@ -3257,6 +3445,20 @@ function bindPanelEvents() {
         updatePromptInjection();
         renderNsfw(); renderOverview();
         toastr.info(settings.nsfw ? 'NSFW 已开启' : 'NSFW 已关闭');
+    });
+
+    // NPC 自主行动（独立开关，不影响自动导演）
+    panel.on('change', '.amor__npc', function () {
+        settings.npcAutonomy = this.checked;
+        saveSettings(); updatePromptInjection();
+        renderNpcLevel(); renderOverview();
+        toastr.info(settings.npcAutonomy ? 'NPC 自主行动已开启' : 'NPC 自主行动已关闭');
+    });
+    panel.on('click', '.amor__npc-level .amor__seg-btn', function () {
+        const v = String($(this).data('v') || '');
+        settings.npcAutonomyLevel = (v === 'offscene' || v === 'plot') ? v : 'scene';
+        saveSettings(); updatePromptInjection();
+        renderNpcLevel(); renderOverview();
     });
 
     // 自动导演开关
@@ -3381,12 +3583,100 @@ function bindPanelEvents() {
             settings.pacing = st.pacing;
             if (typeof st.nsfw === 'boolean') settings.nsfw = st.nsfw;
             if (st.nsfwMode === 'allow' || st.nsfwMode === 'push') settings.nsfwMode = st.nsfwMode;
+            settings.scene = '';   // 风格与场景互斥：选了风格就清掉场景
         }
         settings.style = st ? st.id : '';
         saveSettings();
         renderPanel();
         renderOverview();
         updatePromptInjection();
+    });
+
+    // 场景导演（与风格互斥，选场景会清掉风格）
+    panel.on('click', '.amor__scenes .amor__seg-btn', function () {
+        userTouchedDirector();
+        const id = String($(this).data('id') || '');
+        applyScene(id);
+        saveSettings();
+        renderPanel();
+        renderOverview();
+        updatePromptInjection();
+    });
+    panel.on('change', '.amor__auto-scene', function () {
+        settings.autoScene = this.checked;
+        saveSettings();
+        renderOverview();
+        if (settings.autoScene) {
+            toastr.info('已开启「每轮自动判断场景」');
+            autoDirect();
+        } else {
+            toastr.info('已关闭「每轮自动判断场景」');
+        }
+    });
+
+    // 指令模板（保存 / 切换 / 编辑 / 复制 / 删除）
+    panel.on('click', '.amor__tpl-save', function () {
+        userTouchedDirector();
+        const name = String(panel.find('.amor__tpl-name').val() || '').trim();
+        const text = String(panel.find('.amor__tpl-text').val() || '').trim();
+        if (!text) { toastr.warning('请先填模板内容'); return; }
+        if (editingTemplateId) {
+            const t = (settings.instructionTemplates || []).find(x => x.id === editingTemplateId);
+            if (t) { t.name = name || '未命名'; t.text = text; }
+            editingTemplateId = null;
+            panel.find('.amor__tpl-cancel').hide();
+            toastr.success('已更新模板');
+        } else {
+            settings.instructionTemplates.push({ id: uid(), name: name || '未命名', text, on: true });
+            toastr.success('已保存模板并启用');
+        }
+        panel.find('.amor__tpl-name').val('');
+        panel.find('.amor__tpl-text').val('');
+        saveSettings(); updatePromptInjection();
+        renderTemplates(); renderOverview();
+    });
+    panel.on('click', '.amor__tpl-cancel', function () {
+        editingTemplateId = null;
+        panel.find('.amor__tpl-name').val('');
+        panel.find('.amor__tpl-text').val('');
+        panel.find('.amor__tpl-cancel').hide();
+    });
+    panel.on('click', '.amor__tpl-toggle', function () {
+        userTouchedDirector();
+        const t = (settings.instructionTemplates || []).find(x => x.id === $(this).data('id'));
+        if (!t) return;
+        t.on = !t.on;
+        saveSettings(); updatePromptInjection();
+        renderTemplates(); renderOverview();
+    });
+    panel.on('click', '.amor__tpl-edit', function () {
+        const t = (settings.instructionTemplates || []).find(x => x.id === $(this).data('id'));
+        if (!t) return;
+        editingTemplateId = t.id;
+        panel.find('.amor__tpl-name').val(t.name);
+        panel.find('.amor__tpl-text').val(t.text);
+        panel.find('.amor__tpl-cancel').show();
+        panel.find('.amor__tpl-name').trigger('focus');
+    });
+    panel.on('click', '.amor__tpl-copy', function () {
+        const t = (settings.instructionTemplates || []).find(x => x.id === $(this).data('id'));
+        if (!t) return;
+        settings.instructionTemplates.push({ id: uid(), name: (t.name || '未命名') + ' 副本', text: t.text, on: false });
+        saveSettings();
+        renderTemplates();
+        toastr.success('已复制模板');
+    });
+    panel.on('click', '.amor__tpl-del', function () {
+        userTouchedDirector();
+        settings.instructionTemplates = (settings.instructionTemplates || []).filter(x => x.id !== $(this).data('id'));
+        if (editingTemplateId === $(this).data('id')) {
+            editingTemplateId = null;
+            panel.find('.amor__tpl-name').val('');
+            panel.find('.amor__tpl-text').val('');
+            panel.find('.amor__tpl-cancel').hide();
+        }
+        saveSettings(); updatePromptInjection();
+        renderTemplates(); renderOverview();
     });
     panel.on('click', '.amor__preset-load', function () {
         const p = settings.presets.find(x => x.id === $(this).data('id'));
@@ -3426,6 +3716,16 @@ jQuery(async () => {
     for (const ev of [event_types.MESSAGE_DELETED, event_types.MESSAGE_SWIPED]) {
         if (ev) eventSource.on(ev, () => setTimeout(() => plannerReconcile(), 200));
     }
+
+    // 每次生成开始前，记录这一轮实际要注入的导演指令（用于排查 OOC / 节奏失控）
+    eventSource.on(event_types.GENERATION_STARTED, () => {
+        const instr = buildDirectorPrompt();
+        if (!instr || !instr.trim()) return;
+        settings.injectionHistory.unshift({ ts: Date.now(), text: instr });
+        if (settings.injectionHistory.length > HISTORY_LIMIT) settings.injectionHistory.length = HISTORY_LIMIT;
+        saveSettingsDebounced();
+        if ($('#st-amor').is(':visible')) renderInjectionHistory();
+    });
 
     // 每轮生成结束后，自动导演分析剧情并调整下一轮的导演指令
     eventSource.on(event_types.GENERATION_ENDED, () => {
