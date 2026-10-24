@@ -72,6 +72,16 @@ const BUILTIN_PRESETS = [
     { name: '虐恋拉扯', data: { nsfw: false, nsfwMode: 'push', rhythm: '紧张', camera: '近景', focus: { psy: 9, env: 4, dialog: 6, action: 4 }, initiative: { user: '中', ai: '中', npc: '低' }, pacing: 3, custom: '虐恋拉扯：爱而不得、反复试探与回避，情绪浓度高、有痛感也有甜头，但不堆砌狗血。', style: '' } },
 ];
 
+// 导演台指令（可多选叠加，勾选后每轮都注入对应指令；不改变事实，只约束「怎么写 / 怎么推」）
+const DIRECTOR_MODES = [
+    { id: 'butterfly', name: '蝴蝶效应', text: '每轮检查已有剧情线，选择一个有因果依据、尚未充分发展的细节，推动其产生合理而意外的影响。每轮最多突出一个主要变化，不得凭空制造巧合，不得强行反转。' },
+    { id: 'tug', name: '慢热拉扯', text: '优先表现人物潜台词、克制、试探与细微反应。关系变化通过连续互动逐渐积累，不急于告白、和解或确认关系。每轮可以没有显著进展，但必须保留真实的情绪与互动。' },
+    { id: 'ensemble', name: '群像', text: '根据当前事件选择真正相关的角色参与，不让所有 NPC 同时登场。每个角色必须具有独立目标、知识边界和鲜明反应。角色之间可以发生不围绕玩家的互动，但所有变化都应符合现有世界状态。' },
+    { id: 'suspense', name: '悬疑', text: '围绕已有疑点逐步释放线索，区分事实、推测与谣言。严格维护各角色的知识边界，不提前揭晓核心答案。误导必须有合理来源，线索之间应能形成可追溯的因果链。' },
+    { id: 'consequence', name: '后果追踪', text: '优先检查过去的承诺、冲突、选择、损失和未解决事件，挑选本轮最自然的一项产生后续影响。影响应与原事件的严重程度相称，避免重复提醒或突然放大后果。' },
+    { id: 'antitrope', name: '反套路', text: '不要将常见叙事套路视为必然剧情。每次生成前，检查当前发展是否只是对常见情节模板的机械复现。优先根据人物独特的性格、现实处境、既有关系与当前选择推导行为；相同情境可以产生不同结果。允许人物做出不符合常见套路、但符合自身逻辑的选择。不要为了制造新鲜感而刻意反套路，也不要强行制造意外；真正的变化应当来自人物与情境本身，而不是作者对套路的刻意规避。' },
+];
+
 // ---------------- 状态 ----------------
 function freshSettings() {
     return {
@@ -86,6 +96,7 @@ function freshSettings() {
         pacing: 5,             // 0-10，0=慢 10=快
         custom: '',            // 自定义导演指令
         style: '',             // 内置风格 id（STYLE_PRESETS），空 = 无
+        directorModes: [],     // 已开启的导演台指令 id（DIRECTOR_MODES）
         dirOverride: '',       // 手动覆盖导演指令全文，空 = 自动生成
         dirOverrideBase: '',   // 保存覆盖时的导演台旋钮快照，用来判断自动版是否已变
         autoDirector: false,   // 自动导演模式（每轮生成后 AI 分析并调整旋钮）
@@ -145,6 +156,7 @@ function loadSettings() {
         }
         s.builtinSeeded = true;
     }
+    if (!Array.isArray(s.directorModes)) s.directorModes = [];
     const pdef = freshPlanner();
     const p = (s.planner && typeof s.planner === 'object' && !Array.isArray(s.planner)) ? s.planner : {};
     p.api = Object.assign({}, pdef.api, (p.api && typeof p.api === 'object') ? p.api : {});
@@ -203,6 +215,9 @@ function buildDirectorPromptAuto() {
     lines.push('· 剧情推进速度：' + pacingDesc(settings.pacing != null ? settings.pacing : 5));
     const st = STYLE_PRESETS.find(x => x.id === settings.style);
     if (st && st.hint) lines.push('· 风格基调（' + st.name + '，只影响怎么写，不改变任何事实与设定）：' + st.hint);
+    for (const m of DIRECTOR_MODES) {
+        if ((settings.directorModes || []).includes(m.id)) lines.push('· 导演指令（' + m.name + '）：' + m.text);
+    }
     if (settings.custom && settings.custom.trim()) lines.push('· 自定义导演指令：' + settings.custom.trim());
     return lines.join('\n');
 }
@@ -2961,6 +2976,11 @@ function buildPanel() {
         </div>
 
         <div class="amor__section">
+          <div class="amor__label">导演指令（可多选叠加；勾选后每轮注入对应指令，不影响事实，只约束怎么写 / 怎么推）</div>
+          <div class="amor__dmodes"></div>
+        </div>
+
+        <div class="amor__section">
           <div class="amor__label">预设</div>
           <div class="amor__preset-add">
             <input type="text" class="amor__preset-name" placeholder="预设名，如 甜宠日常">
@@ -3049,6 +3069,7 @@ function renderPanel() {
     // 自定义指令
     panel.find('.amor__custom').val(settings.custom);
 
+    renderDirectorModes();
     renderPresets();
 }
 
@@ -3060,6 +3081,16 @@ function renderNsfw() {
         : '当前：未开启，不会发送。');
     const ta = panel.find('.amor__nsfw-text');
     if (!ta.is(':focus')) ta.val(nsfwText());
+}
+
+function renderDirectorModes() {
+    const el = $('#st-amor .amor__dmodes');
+    if (!el.length) return;
+    el.empty();
+    DIRECTOR_MODES.forEach(m => {
+        const on = (settings.directorModes || []).includes(m.id);
+        el.append(`<button type="button" class="amor__dmode${on ? ' on' : ''}" data-id="${m.id}" title="${escapeHtml(m.text)}">${m.name}</button>`);
+    });
 }
 
 function renderPresets() {
@@ -3120,6 +3151,7 @@ function applyImportedSettings(src) {
     if (typeof src.nsfw === 'boolean') keep.nsfw = src.nsfw;
     if (src.nsfwMode === 'allow' || src.nsfwMode === 'push') keep.nsfwMode = src.nsfwMode;
     if (typeof src.nsfwPrompt === 'string') keep.nsfwPrompt = src.nsfwPrompt.slice(0, 4000);
+    if (Array.isArray(src.directorModes)) keep.directorModes = src.directorModes.filter(m => DIRECTOR_MODES.some(x => x.id === m));
     Object.assign(settings, keep, { focus, initiative: init });
     settings.dirOverrideBase = keep.dirOverride ? JSON.stringify(snapshotDirector()) : '';
     if (Array.isArray(src.presets)) {
@@ -3162,6 +3194,7 @@ function snapshotDirector() {
         pacing: settings.pacing,
         custom: settings.custom,
         style: settings.style,
+        directorModes: (settings.directorModes || []).slice(),
     };
 }
 
@@ -3310,6 +3343,19 @@ function bindPanelEvents() {
         userTouchedDirector();
         settings.custom = this.value;
         saveSettings(); updatePromptInjection();
+    });
+
+    // 导演指令（可多选叠加）
+    panel.on('click', '.amor__dmode', function () {
+        userTouchedDirector();
+        const id = String($(this).data('id') || '');
+        if (!DIRECTOR_MODES.some(m => m.id === id)) return;
+        const arr = (settings.directorModes || []).slice();
+        const i = arr.indexOf(id);
+        if (i >= 0) arr.splice(i, 1); else arr.push(id);
+        settings.directorModes = arr;
+        saveSettings(); updatePromptInjection();
+        renderDirectorModes(); renderOverview();
     });
 
     // 预设
