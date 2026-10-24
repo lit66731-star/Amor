@@ -466,3 +466,70 @@
     #st-amor .amor__head { padding: 14px 16px 10px; }
     #st-amor .amor__tabs { padding: 8px 14px; }
 }
+
+/* ============ 酒馆主题隔离：任何主题/美化包都不改变面板外观 ============ */
+#st-amor, #st-amor * { text-shadow: none !important; }
+#st-amor input[type="text"],
+#st-amor input[type="password"],
+#st-amor input[type="number"],
+#st-amor input[type="search"],
+#st-amor textarea,
+#st-amor select {
+    background: var(--amor-surface) !important;
+    color: var(--amor-text) !important;
+    -webkit-text-fill-color: var(--amor-text) !important;
+    caret-color: var(--amor-text) !important;
+    box-shadow: none !important;
+    text-shadow: none !important;
+    font-family: inherit;
+}
+#st-amor button { text-shadow: none !important; box-shadow: none !important; }
+#st-amor input[type="range"] { background: transparent !important; }
+
+/* ============ 模型选择弹窗 ============ */
+#st-amor .amor__model-row { display: flex; gap: 8px; align-items: center; }
+#st-amor .amor__model-row input { flex: 1; min-width: 0; }
+#st-amor .amor__model-fetch {
+    padding: 8px 14px; font-size: 13px; white-space: nowrap;
+    background: var(--amor-dark); color: #fff;
+    border: 1px solid var(--amor-dark); border-radius: 8px; cursor: pointer;
+}
+#st-amor .amor__model-fetch:hover { opacity: 0.9; }
+#st-amor .amor__modal-overlay {
+    position: absolute; inset: 0; z-index: 21000;
+    display: flex; align-items: center; justify-content: center;
+    padding: 20px; background: rgba(0, 0, 0, 0.5); box-sizing: border-box;
+}
+#st-amor .amor__modal {
+    width: 100%; max-width: 460px; max-height: calc(100vh - 80px); overflow-y: auto;
+    background: var(--amor-surface); border: 1px solid var(--amor-border);
+    border-radius: 12px; padding: 20px; box-sizing: border-box;
+}
+#st-amor .amor__modal-title { font-size: 15px; font-weight: 600; color: var(--amor-text); margin-bottom: 6px; }
+#st-amor .amor__model-sub { font-size: 12px; color: var(--amor-text-soft); font-weight: 400; }
+#st-amor .amor__model-search {
+    width: 100%; box-sizing: border-box; height: 34px; padding: 0 12px;
+    font-size: 13px; color: var(--amor-text); background: var(--amor-surface);
+    border: 1px solid var(--amor-border); border-radius: 8px; outline: none; margin-bottom: 12px; font-family: inherit;
+}
+#st-amor .amor__model-search:focus { border-color: var(--amor-accent); }
+#st-amor .amor__model-list { max-height: 320px; overflow-y: auto; display: flex; flex-direction: column; gap: 6px; margin-bottom: 12px; }
+#st-amor .amor__model-item {
+    text-align: left; width: 100%; padding: 9px 12px; font-size: 13px;
+    background: var(--amor-surface); border: 1px solid var(--amor-border); border-radius: 8px;
+    color: var(--amor-text); cursor: pointer; word-break: break-all; font-family: inherit;
+}
+#st-amor .amor__model-item:hover { border-color: var(--amor-accent); }
+#st-amor .amor__model-empty { padding: 18px 8px; text-align: center; font-size: 13px; color: var(--amor-text-soft); }
+#st-amor .amor__modal-actions { display: flex; justify-content: flex-end; }
+#st-amor .amor__modal-cancel {
+    background: transparent; border: 1px solid var(--amor-border); color: var(--amor-text-soft);
+    border-radius: 8px; height: 34px; padding: 0 16px; font-size: 13px; cursor: pointer; font-family: inherit;
+}
+#st-amor .amor__modal-cancel:hover { color: var(--amor-text); }
+
+/* 内置预设标签 */
+#st-amor .amor__preset-builtin {
+    font-style: normal; font-size: 11px; color: var(--amor-accent);
+    border: 1px solid var(--amor-accent); border-radius: 10px; padding: 0 6px; margin-left: 8px;
+}

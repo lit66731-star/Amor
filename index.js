@@ -16,7 +16,7 @@ import { selected_group } from '../../../group-chats.js';
 import { getStringHash } from '../../../utils.js';
 
 const extensionName = 'amor';
-const VERSION = '1.15.1';
+const VERSION = '1.16.0';
 
 // ---------------- 维度常量 ----------------
 const RHYTHMS = ['平缓', '日常', '暧昧', '紧张', '冲突', '高潮', '余波'];
@@ -54,6 +54,22 @@ const STYLE_PRESETS = [
       hint: '基调压抑沉重，不回避人物的痛苦与代价，但不渲染不必要的残忍细节。' },
     { id: 'adventure', name: '冒险', rhythm: '紧张', camera: '动作描写', focus: { psy: 3, env: 7, dialog: 4, action: 9 }, initiative: { user: '中', ai: '中', npc: '高' }, pacing: 8,
       hint: '推进明确，有行动和发现，场景不断变化，每一步都带来新的目标或阻碍。' },
+    { id: 'detailed', name: '细腻', rhythm: '平缓', camera: '近景', focus: { psy: 9, env: 7, dialog: 6, action: 3 }, initiative: { user: '中', ai: '中', npc: '低' }, pacing: 2,
+      hint: '以极细的笔触写当下：动作拆成步骤、情绪拆成层次、感官写到位，宁可慢一点也要让每个变化都具体、有新意，不套用常见桥段和模板化表达。' },
+    { id: 'poetic', name: '诗意', rhythm: '平缓', camera: '环境描写', focus: { psy: 6, env: 9, dialog: 5, action: 2 }, initiative: { user: '中', ai: '中', npc: '低' }, pacing: 2,
+      hint: '语言追求意象与留白，用景物、光影、声音烘托情绪，画面感与弦外之音优先，不一味推进情节。' },
+    { id: 'nsfw', name: 'NSFW 亲密', rhythm: '暧昧', camera: '人物特写', focus: { psy: 8, env: 4, dialog: 4, action: 8 }, initiative: { user: '中', ai: '高', npc: '高' }, pacing: 3, nsfw: true, nsfwMode: 'push',
+      hint: '亲密场景写得具体、细腻、有层次：从眼神、距离、触感到身体反应，循序渐进、层层推进，重视双方的互动与感受，不回避、不跳步。' },
+];
+
+// 内置导演台预设（完整旋钮快照，含 NSFW 档位）：首次加载自动放进「预设」列表，可载入、可删除
+const BUILTIN_PRESETS = [
+    { name: 'NSFW 主动亲密', data: { nsfw: true, nsfwMode: 'push', rhythm: '暧昧', camera: '人物特写', focus: { psy: 8, env: 4, dialog: 4, action: 8 }, initiative: { user: '中', ai: '高', npc: '高' }, pacing: 3, custom: '', style: 'nsfw' } },
+    { name: '细腻慢热', data: { nsfw: false, nsfwMode: 'push', rhythm: '平缓', camera: '近景', focus: { psy: 9, env: 7, dialog: 6, action: 3 }, initiative: { user: '中', ai: '中', npc: '低' }, pacing: 2, custom: '', style: 'detailed' } },
+    { name: '男狐狸（魅惑撩人）', data: { nsfw: false, nsfwMode: 'push', rhythm: '暧昧', camera: '人物特写', focus: { psy: 7, env: 5, dialog: 8, action: 4 }, initiative: { user: '中', ai: '高', npc: '中' }, pacing: 3, custom: '扮演魅惑撩人、欲拒还迎的男狐狸：语气勾人、话里有话，撩而不露，把暧昧的主动权捏在自己手里，逗弄对方却又不轻易摊牌。', style: '' } },
+    { name: '甜宠日常', data: { nsfw: false, nsfwMode: 'push', rhythm: '日常', camera: '中景', focus: { psy: 6, env: 5, dialog: 7, action: 4 }, initiative: { user: '中', ai: '中', npc: '低' }, pacing: 4, custom: '甜宠日常：轻松温馨，日常互动里有糖，语气宠溺但不腻，节奏舒缓。', style: '' } },
+    { name: '电影感大片', data: { nsfw: false, nsfwMode: 'push', rhythm: '紧张', camera: '中景', focus: { psy: 4, env: 8, dialog: 5, action: 7 }, initiative: { user: '中', ai: '中', npc: '高' }, pacing: 6, custom: '', style: 'cinematic' } },
+    { name: '虐恋拉扯', data: { nsfw: false, nsfwMode: 'push', rhythm: '紧张', camera: '近景', focus: { psy: 9, env: 4, dialog: 6, action: 4 }, initiative: { user: '中', ai: '中', npc: '低' }, pacing: 3, custom: '虐恋拉扯：爱而不得、反复试探与回避，情绪浓度高、有痛感也有甜头，但不堆砌狗血。', style: '' } },
 ];
 
 // ---------------- 状态 ----------------
@@ -78,6 +94,7 @@ function freshSettings() {
         autoRefresh: false,    // 定时自动刷新（开启自动导演时按间隔重新分析）
         autoRefreshSec: 60,    // 定时刷新间隔（秒）
         presets: [],           // [{ id, name, data }]
+        builtinSeeded: false,  // 是否已把内置导演台预设播种进 presets（只做一次，用户删除后不再补回）
         planner: freshPlanner(),   // 剧情规划（场景 / 目标 / 冲突 / 节拍）
     };
 }
@@ -121,6 +138,13 @@ function loadSettings() {
     if (typeof s.autoRefresh !== 'boolean') s.autoRefresh = !!s.autoRefresh;
     if (typeof s.autoRefreshSec !== 'number' || s.autoRefreshSec < 15) s.autoRefreshSec = 60;
     if (!Array.isArray(s.presets)) s.presets = [];
+    if (s.builtinSeeded !== true) {
+        const names = new Set(s.presets.map(p => p && p.name));
+        for (const bp of BUILTIN_PRESETS) {
+            if (!names.has(bp.name)) { s.presets.push({ id: uid(), name: bp.name, data: clone(bp.data), builtin: true }); names.add(bp.name); }
+        }
+        s.builtinSeeded = true;
+    }
     const pdef = freshPlanner();
     const p = (s.planner && typeof s.planner === 'object' && !Array.isArray(s.planner)) ? s.planner : {};
     p.api = Object.assign({}, pdef.api, (p.api && typeof p.api === 'object') ? p.api : {});
@@ -718,6 +742,58 @@ async function callPlannerLLM({ prompt, systemPrompt }) {
         throw new Error('未配置插件 API（不会回退到聊天 API）');
     }
     return callPlannerApi({ prompt, systemPrompt });
+}
+
+// ---------------- 模型拉取 + 弹窗选择 ----------------
+// 拉取 OpenAI 兼容接口的 /models，返回模型 id 列表；浏览器直连（需对方允许 CORS）
+async function fetchModelList() {
+    const c = settings.planner.api;
+    if (!c.url) throw new Error('请先填 API 地址');
+    const endpoint = plannerBaseUrl(c.url) + '/models';
+    const headers = {};
+    if (c.key) headers.Authorization = 'Bearer ' + c.key.trim();
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 30000);
+    let res;
+    try { res = await fetch(endpoint, { headers, signal: ctrl.signal }); }
+    catch (e) {
+        clearTimeout(timer);
+        const m = safeErrorText(e, c.key) || '拉取失败';
+        throw new Error(/failed to fetch|networkerror|load failed/i.test(m) ? '浏览器直连被拦截（多半是对方服务不允许跨域 CORS），请检查地址是否可达' : m);
+    }
+    clearTimeout(timer);
+    if (!res.ok) {
+        const t = await res.text().catch(() => '');
+        throw new Error('HTTP ' + res.status + (t ? ' ' + safeErrorText(t, c.key) : ''));
+    }
+    const d = await res.json().catch(() => ({}));
+    const raw = (d && Array.isArray(d.data)) ? d.data : (Array.isArray(d) ? d : []);
+    const seen = new Set();
+    return raw.map(m => ((m && typeof m.id === 'string') ? m.id : (m && typeof m === 'string') ? m : ''))
+        .filter(Boolean).filter(id => { if (seen.has(id)) return false; seen.add(id); return true; });
+}
+function renderModelPickerList() {
+    const overlay = $('#st-amor .amor__model-overlay');
+    const listEl = overlay.find('.amor__model-list');
+    const items = overlay.data('models') || [];
+    const q = String(overlay.find('.amor__model-search').val() || '').trim().toLowerCase();
+    const filtered = items.filter(id => !q || String(id).toLowerCase().indexOf(q) >= 0);
+    if (!filtered.length) { listEl.html('<div class="amor__model-empty">没有匹配的模型（换个关键词，或重新拉取）</div>'); return; }
+    listEl.html(filtered.map(id => '<button type="button" class="amor__model-item" data-model="' + escapeHtml(id) + '">' + escapeHtml(id) + '</button>').join(''));
+}
+function openModelPicker(list) {
+    const overlay = $('#st-amor .amor__model-overlay');
+    if (!overlay.length) return;
+    overlay.data('models', Array.isArray(list) ? list : []);
+    overlay.find('.amor__model-sub').text('（' + (Array.isArray(list) ? list.length : 0) + ' 个）');
+    overlay.find('.amor__model-search').val('');
+    renderModelPickerList();
+    overlay.show();
+    overlay.find('.amor__model-search').trigger('focus');
+}
+function closeModelPicker() {
+    const overlay = $('#st-amor .amor__model-overlay');
+    if (overlay.length) { overlay.hide(); overlay.removeData('models'); }
 }
 
 // ---- 剧情线（Plot Thread）：Amor 对故事脉络的归纳，属于解释，不是事实 ----
@@ -1882,7 +1958,7 @@ function plannerPageHtml() {
           <div class="amor__p-field-label amor__p-sub">插件 API（规划 / 导演 / 会诊 / 选项都用它，未配置时不调用任何 API）</div>
           <div class="amor__p-field"><div class="amor__p-field-label">API 地址（OpenAI 兼容）</div><input type="text" class="amor__p-api" data-api="url" placeholder="https://.../v1" autocomplete="off"></div>
           <div class="amor__p-field"><div class="amor__p-field-label">API Key</div><input type="password" class="amor__p-api" data-api="key" autocomplete="off"></div>
-          <div class="amor__p-field"><div class="amor__p-field-label">模型名</div><input type="text" class="amor__p-api" data-api="model" autocomplete="off"></div>
+          <div class="amor__p-field"><div class="amor__p-field-label">模型名</div><div class="amor__model-row"><input type="text" class="amor__p-api" data-api="model" autocomplete="off"><button type="button" class="amor__model-fetch">拉取模型列表</button></div></div>
         </div>
 
         <div class="amor__section">
@@ -2292,6 +2368,29 @@ function bindPlannerEvents() {
         settings.planner.api[$(this).data('api')] = String($(this).val()).trim();
         saveSettings();
     });
+
+    // 拉取模型列表 → 弹窗点选
+    panel.on('click', '.amor__model-fetch', async function () {
+        const btn = $(this).prop('disabled', true);
+        try {
+            const list = await fetchModelList();
+            toastr.success('已拉取 ' + list.length + ' 个模型，请在弹窗里点选');
+            openModelPicker(list);
+        } catch (e) { toastr.error('拉取失败：' + safeErrorText(e, settings.planner.api.key)); }
+        finally { btn.prop('disabled', false); }
+    });
+    panel.on('click', '.amor__model-item', function () {
+        const modelId = String($(this).data('model') || '');
+        if (!modelId) return;
+        settings.planner.api.model = modelId;
+        saveSettings();
+        panel.find('.amor__p-api[data-api="model"]').val(modelId);
+        closeModelPicker();
+        toastr.success('已选择模型：' + modelId);
+    });
+    panel.on('input', '.amor__model-search', renderModelPickerList);
+    panel.on('click', '.amor__model-overlay .amor__model-cancel', closeModelPicker);
+    panel.on('click', '.amor__model-overlay', function (e) { if (e.target === this) closeModelPicker(); });
 }
 
 function renderKnowledge(cd) {
@@ -2872,6 +2971,16 @@ function buildPanel() {
         <div class="amor__hint">导演模式开启后，每次生成都会在角色设定之前注入一段「导演指令」，控制 AI 的节奏 / 镜头 / 叙事重点 / 角色主动性 / 推进速度。指令优先级最高，AI 会照着演。开启「自动导演」后，每轮生成结束 AI 会自动分析剧情、调整下方旋钮并写一句导演指令；若已安装 Serendipity，会自动读取其剧情时间/时间线/人物/关系/世界状态/伏笔作为剧情背景。可点「立即导演」手动分析，或开启「定时自动刷新」按间隔持续分析。</div>
       </div>
       ${plannerPageHtml()}
+      <div class="amor__modal-overlay amor__model-overlay" style="display:none">
+        <div class="amor__modal">
+          <div class="amor__modal-title">选择模型<span class="amor__model-sub"></span></div>
+          <input type="text" class="amor__model-search" placeholder="输入关键词过滤模型（可留空看全部）" autocomplete="off">
+          <div class="amor__model-list"></div>
+          <div class="amor__modal-actions">
+            <button type="button" class="amor__modal-cancel amor__model-cancel">取消</button>
+          </div>
+        </div>
+      </div>
     </div>`;
     $('body').append(html);
     bindPanelEvents();
@@ -2959,7 +3068,7 @@ function renderPresets() {
     if (!settings.presets.length) { el.append('<div class="amor__preset-empty">暂无预设</div>'); return; }
     settings.presets.forEach(p => {
         el.append(`<div class="amor__preset-row">
-          <span class="amor__preset-name">${escapeHtml(p.name)}</span>
+          <span class="amor__preset-name">${escapeHtml(p.name)}${p.builtin ? '<i class="amor__preset-builtin">内置</i>' : ''}</span>
           <button type="button" class="amor__preset-load" data-id="${p.id}">载入</button>
           <button type="button" class="amor__preset-del" data-id="${p.id}">删除</button>
         </div>`);
@@ -3043,6 +3152,8 @@ function downloadText(filename, text) {
 
 function snapshotDirector() {
     return {
+        nsfw: settings.nsfw,
+        nsfwMode: settings.nsfwMode,
         rhythm: settings.rhythm,
         camera: settings.camera,
         focus: Object.assign({}, settings.focus),
@@ -3051,6 +3162,20 @@ function snapshotDirector() {
         custom: settings.custom,
         style: settings.style,
     };
+}
+
+// 用户手动动过导演台任一旋钮后，自动退出「自动导演」，避免下一轮被 AI 的分析结果覆盖
+function userTouchedDirector() {
+    if (!settings.autoDirector) return;
+    settings.autoDirector = false;
+    saveSettings();
+    const box = $('#st-amor');
+    if (box.length) {
+        box.find('.amor__auto').prop('checked', false);
+        box.find('.amor__auto-note').hide();
+    }
+    syncAutoRefreshTimer();
+    toastr.info('已切换为手动导演：自动导演已关闭，你调的旋钮不会再被覆盖');
 }
 
 function bindPanelEvents() {
@@ -3137,12 +3262,14 @@ function bindPanelEvents() {
 
     // 剧情节奏 / 镜头（单选，再点取消）
     panel.on('click', '.amor__rhythm .amor__seg-btn', function () {
+        userTouchedDirector();
         const v = $(this).data('v');
         settings.rhythm = (settings.rhythm === v) ? '' : v;
         saveSettings(); updatePromptInjection();
         panel.find('.amor__rhythm .amor__seg-btn').each(function () { $(this).toggleClass('on', $(this).data('v') === settings.rhythm); });
     });
     panel.on('click', '.amor__camera .amor__seg-btn', function () {
+        userTouchedDirector();
         const v = $(this).data('v');
         settings.camera = (settings.camera === v) ? '' : v;
         saveSettings(); updatePromptInjection();
@@ -3151,6 +3278,7 @@ function bindPanelEvents() {
 
     // 角色主动性（每角色单选）
     panel.on('click', '.amor__initiative .amor__seg-btn', function () {
+        userTouchedDirector();
         const role = $(this).data('role');
         const lv = $(this).data('v');
         settings.initiative[role] = lv;
@@ -3160,12 +3288,14 @@ function bindPanelEvents() {
 
     // 叙事重点滑条
     panel.on('input', '.amor__focus-row input', function () {
+        userTouchedDirector();
         settings.focus[$(this).data('key')] = parseInt(this.value, 10);
         saveSettings(); updatePromptInjection();
     });
 
     // 推进速度滑条
     panel.on('input', '.amor__pacing', function () {
+        userTouchedDirector();
         settings.pacing = parseInt(this.value, 10);
         saveSettings(); updatePromptInjection();
         panel.find('.amor__pacing-hint').text(pacingDesc(settings.pacing));
@@ -3173,6 +3303,7 @@ function bindPanelEvents() {
 
     // 自定义指令
     panel.on('input', '.amor__custom', function () {
+        userTouchedDirector();
         settings.custom = this.value;
         saveSettings(); updatePromptInjection();
     });
@@ -3189,6 +3320,7 @@ function bindPanelEvents() {
         toastr.success('已保存预设「' + name + '」');
     });
     panel.on('click', '.amor__styles .amor__seg-btn', function () {
+        userTouchedDirector();
         const id = String($(this).data('id') || '');
         const st = STYLE_PRESETS.find(x => x.id === id);
         if (st) {
@@ -3197,18 +3329,23 @@ function bindPanelEvents() {
             settings.focus = Object.assign({}, st.focus);
             settings.initiative = Object.assign({}, st.initiative);
             settings.pacing = st.pacing;
+            if (typeof st.nsfw === 'boolean') settings.nsfw = st.nsfw;
+            if (st.nsfwMode === 'allow' || st.nsfwMode === 'push') settings.nsfwMode = st.nsfwMode;
         }
         settings.style = st ? st.id : '';
         saveSettings();
         renderPanel();
+        renderOverview();
         updatePromptInjection();
     });
     panel.on('click', '.amor__preset-load', function () {
         const p = settings.presets.find(x => x.id === $(this).data('id'));
         if (!p) return;
+        userTouchedDirector();
         Object.assign(settings, snapshotDirector(), p.data);
         saveSettings();
         renderPanel();
+        renderOverview();
         updatePromptInjection();
         toastr.success('已载入预设「' + p.name + '」');
     });
