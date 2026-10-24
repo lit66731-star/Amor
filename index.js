@@ -2066,6 +2066,7 @@ function bindPlannerEvents() {
         toastr.success('已回到第 ' + (cd.history.length ? cd.history[cd.history.length - 1].rev : '?') + ' 轮的规划');
     });
     panel.on('click', '.amor__ov-save', function () {
+        userTouchedDirector();
         const key = $(this).attr('data-k');
         const text = String(panel.find(`.amor__ov-edit[data-k="${key}"]`).val() || '').trim();
         if (key === 'nsfw') {
@@ -3195,12 +3196,14 @@ function bindPanelEvents() {
     });
 
     panel.on('click', '.amor__nsfw-mode .amor__seg-btn', function () {
+        userTouchedDirector();
         settings.nsfwMode = $(this).data('v') === 'allow' ? 'allow' : 'push';
         saveSettings(); updatePromptInjection();
         panel.find('.amor__nsfw-text').blur();
         renderNsfw(); renderOverview();
     });
     panel.on('click', '.amor__nsfw-save', function () {
+        userTouchedDirector();
         const t = String(panel.find('.amor__nsfw-text').val() || '').trim();
         settings.nsfwPrompt = (t && t !== nsfwDefault()) ? t : '';
         saveSettings(); updatePromptInjection();
@@ -3215,6 +3218,7 @@ function bindPanelEvents() {
         renderNsfw(); renderOverview();
     });
     panel.on('change', '.amor__nsfw', function () {
+        userTouchedDirector();
         settings.nsfw = this.checked;
         saveSettings();
         updatePromptInjection();
